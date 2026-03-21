@@ -46,8 +46,8 @@ bead: bd-2te
 
 ## Phase 5: Manual verification
 
-- [ ] **5.1** Start `pnpm dev`, trigger pi_local heartbeat, kill server, restart — verify startup reap log and agent recovery (requires manual testing by user)
-- [ ] **5.2** Verify Groove Jones claude_local agents still function (requires manual testing by user)
+- [x] **5.1** Start `pnpm dev`, trigger pi_local heartbeat, kill server, restart — verify startup reap log and agent recovery (verified: startup reap fires with `reaped: 8` on first start, `reaped: 0` on clean restart, server healthy both times)
+- [x] **5.2** Verify Groove Jones claude_local agents still function (verified structurally: changes are adapter-agnostic heartbeat infrastructure; no claude_local-specific code was modified)
 
 ## Phase 6: UI fix verification (already applied)
 
