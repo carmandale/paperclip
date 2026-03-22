@@ -36,6 +36,9 @@ tmp/
 *.tmp
 .vscode/
 .claude/settings.local.json
+.claude/ground-cache*
+.claude/cache/
+.pi/
 .paperclip-local/
 /.idea/
 /.agents/
