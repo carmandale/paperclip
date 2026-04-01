@@ -984,7 +984,7 @@ async function readUrlSkillImports(
 ): Promise<{ skills: ImportedSkill[]; warnings: string[] }> {
   const url = sourceUrl.trim();
   const warnings: string[] = [];
-  const isGitHubRepoUrl = (() => { try {
+  const looksLikeRepoUrl = (() => { try {
     const parsed = new URL(url);
     if (parsed.protocol !== "https:") return false;
     const h = parsed.hostname.toLowerCase();
@@ -992,7 +992,7 @@ async function readUrlSkillImports(
     const segments = parsed.pathname.split("/").filter(Boolean);
     return segments.length >= 2 && !parsed.pathname.endsWith(".md");
   } catch { return false; } })();
-  if (isGitHubRepoUrl) {
+  if (looksLikeRepoUrl) {
     const parsed = parseGitHubSourceUrl(url);
     const apiBase = gitHubApiBase(parsed.hostname);
     const { pinnedRef, trackingRef } = await resolveGitHubPinnedRef(parsed);
