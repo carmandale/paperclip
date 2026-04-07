@@ -375,6 +375,7 @@ describe("company portability", () => {
     expect(
       parseGitHubSourceUrl("https://github.com/paperclipai/companies?ref=feature%2Fdemo&path=gstack"),
     ).toEqual({
+      hostname: "github.com",
       owner: "paperclipai",
       repo: "companies",
       ref: "feature/demo",
@@ -389,6 +390,7 @@ describe("company portability", () => {
         "https://github.com/paperclipai/companies?ref=abc123&companyPath=gstack%2FCOMPANY.md",
       ),
     ).toEqual({
+      hostname: "github.com",
       owner: "paperclipai",
       repo: "companies",
       ref: "abc123",
@@ -1634,6 +1636,50 @@ describe("company portability", () => {
       name: "ClaudeCoder",
       adapterType: "process",
     }));
+  });
+
+  it("preserves agent role from frontmatter when extension block omits it", async () => {
+    const portability = companyPortabilityService({} as any);
+
+    const preview = await portability.previewImport({
+      source: {
+        type: "inline",
+        rootPath: "ceo-package",
+        files: {
+          "COMPANY.md": [
+            "---",
+            'schema: "agentcompanies/v1"',
+            'name: "CEO Role Test"',
+            "---",
+            "",
+          ].join("\n"),
+          "agents/ceo/AGENTS.md": [
+            "---",
+            'name: "CEO"',
+            'role: "ceo"',
+            "---",
+            "",
+            "# CEO",
+            "",
+            "You run the company.",
+            "",
+          ].join("\n"),
+        },
+      },
+      include: { company: true, agents: true, projects: false, issues: false },
+      target: { mode: "new_company", newCompanyName: "CEO Role Test" },
+      agents: "all",
+      collisionStrategy: "rename",
+    });
+
+    expect(preview.errors).toEqual([]);
+    expect(preview.manifest.agents).toEqual([
+      expect.objectContaining({
+        slug: "ceo",
+        name: "CEO",
+        role: "ceo",
+      }),
+    ]);
   });
 
   it("treats no-separator auth and api key env names as secrets during export", async () => {

@@ -81,6 +81,8 @@ export interface DocumentRevision {
   issueId: string;
   key: string;
   revisionNumber: number;
+  title: string | null;
+  format: DocumentFormat;
   body: string;
   changeSummary: string | null;
   createdByAgentId: string | null;
@@ -92,6 +94,25 @@ export interface LegacyPlanDocument {
   key: "plan";
   body: string;
   source: "issue_description";
+}
+
+export interface IssueRelationIssueSummary {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: IssueStatus;
+  priority: IssuePriority;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+}
+
+export interface IssueRelation {
+  id: string;
+  companyId: string;
+  issueId: string;
+  relatedIssueId: string;
+  type: "blocks";
+  relatedIssue: IssueRelationIssueSummary;
 }
 
 export interface Issue {
@@ -131,6 +152,8 @@ export interface Issue {
   hiddenAt: Date | null;
   labelIds?: string[];
   labels?: IssueLabel[];
+  blockedBy?: IssueRelationIssueSummary[];
+  blocks?: IssueRelationIssueSummary[];
   planDocument?: IssueDocument | null;
   documentSummaries?: IssueDocumentSummary[];
   legacyPlanDocument?: LegacyPlanDocument | null;
@@ -141,6 +164,7 @@ export interface Issue {
   mentionedProjects?: Project[];
   myLastTouchAt?: Date | null;
   lastExternalCommentAt?: Date | null;
+  lastActivityAt?: Date | null;
   isUnreadForMe?: boolean;
   createdAt: Date;
   updatedAt: Date;
