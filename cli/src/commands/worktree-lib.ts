@@ -205,6 +205,14 @@ export function buildWorktreeConfig(input: {
         intervalMinutes: source?.database.backup.intervalMinutes ?? 60,
         retentionDays: source?.database.backup.retentionDays ?? 30,
         dir: paths.backupDir,
+        excludeTables: source?.database.backup.excludeTables ?? [
+          "heartbeat_runs",
+          "heartbeat_run_events",
+          "agent_wakeup_requests",
+          "cost_events",
+          "activity_log",
+          "finance_events",
+        ],
       },
     },
     logging: {
@@ -226,6 +234,17 @@ export function buildWorktreeConfig(input: {
     },
     telemetry: {
       enabled: source?.telemetry?.enabled ?? true,
+    },
+    retention: source?.retention ?? {
+      enabled: true,
+      intervalMinutes: 60,
+      heartbeatRunEventsDays: 7,
+      heartbeatRunsDays: 14,
+      agentWakeupRequestsDays: 14,
+      activityLogDays: 30,
+      costEventsDays: 90,
+      financeEventsDays: 90,
+      runLogFilesDays: 14,
     },
     storage: {
       provider: source?.storage.provider ?? "local_disk",

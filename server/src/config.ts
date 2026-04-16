@@ -58,6 +58,16 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  databaseBackupExcludeTables: string[];
+  retentionEnabled: boolean;
+  retentionIntervalMinutes: number;
+  retentionHeartbeatRunEventsDays: number;
+  retentionHeartbeatRunsDays: number;
+  retentionAgentWakeupRequestsDays: number;
+  retentionActivityLogDays: number;
+  retentionCostEventsDays: number;
+  retentionFinanceEventsDays: number;
+  retentionRunLogFilesDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -223,6 +233,71 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  const databaseBackupExcludeTablesFromEnv = process.env.PAPERCLIP_DB_BACKUP_EXCLUDE_TABLES;
+  const databaseBackupExcludeTables: string[] = databaseBackupExcludeTablesFromEnv
+    ? databaseBackupExcludeTablesFromEnv.split(",").map((t) => t.trim()).filter(Boolean)
+    : (fileDatabaseBackup?.excludeTables ?? [
+        "heartbeat_runs",
+        "heartbeat_run_events",
+        "agent_wakeup_requests",
+        "cost_events",
+        "activity_log",
+        "finance_events",
+      ]);
+
+  // Retention config
+  const fileRetention = fileConfig?.retention;
+  const retentionEnabled =
+    process.env.PAPERCLIP_RETENTION_ENABLED !== undefined
+      ? process.env.PAPERCLIP_RETENTION_ENABLED === "true"
+      : (fileRetention?.enabled ?? true);
+  const retentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_INTERVAL_MINUTES) ||
+      fileRetention?.intervalMinutes || 60,
+  );
+  const retentionHeartbeatRunsDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_HEARTBEAT_RUNS_DAYS) ||
+      fileRetention?.heartbeatRunsDays || 14,
+  );
+  let retentionHeartbeatRunEventsDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_HEARTBEAT_RUN_EVENTS_DAYS) ||
+      fileRetention?.heartbeatRunEventsDays || 7,
+  );
+  // AD3: events can't outlive parent runs (CASCADE deletes them at runsDays)
+  if (retentionHeartbeatRunEventsDays > retentionHeartbeatRunsDays) {
+    console.warn(
+      `Retention: heartbeatRunEventsDays (${retentionHeartbeatRunEventsDays}) exceeds heartbeatRunsDays (${retentionHeartbeatRunsDays}), clamping to ${retentionHeartbeatRunsDays}`,
+    );
+    retentionHeartbeatRunEventsDays = retentionHeartbeatRunsDays;
+  }
+  const retentionAgentWakeupRequestsDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_AGENT_WAKEUP_REQUESTS_DAYS) ||
+      fileRetention?.agentWakeupRequestsDays || 14,
+  );
+  const retentionActivityLogDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_ACTIVITY_LOG_DAYS) ||
+      fileRetention?.activityLogDays || 30,
+  );
+  const retentionCostEventsDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_COST_EVENTS_DAYS) ||
+      fileRetention?.costEventsDays || 90,
+  );
+  const retentionFinanceEventsDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_FINANCE_EVENTS_DAYS) ||
+      fileRetention?.financeEventsDays || 90,
+  );
+  const retentionRunLogFilesDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RETENTION_RUN_LOG_FILES_DAYS) ||
+      fileRetention?.runLogFilesDays || 14,
+  );
 
   return {
     deploymentMode,
@@ -243,6 +318,16 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    databaseBackupExcludeTables,
+    retentionEnabled,
+    retentionIntervalMinutes,
+    retentionHeartbeatRunEventsDays,
+    retentionHeartbeatRunsDays,
+    retentionAgentWakeupRequestsDays,
+    retentionActivityLogDays,
+    retentionCostEventsDays,
+    retentionFinanceEventsDays,
+    retentionRunLogFilesDays,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

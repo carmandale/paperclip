@@ -637,6 +637,7 @@ export async function startServer(): Promise<StartedServer> {
           backupDir: config.databaseBackupDir,
           retentionDays: config.databaseBackupRetentionDays,
           filenamePrefix: "paperclip",
+          excludeTables: config.databaseBackupExcludeTables,
         });
         logger.info(
           {
@@ -667,7 +668,20 @@ export async function startServer(): Promise<StartedServer> {
       void runScheduledBackup();
     }, backupIntervalMs);
   }
-  
+
+  let stopRunDataRetention: (() => void) | undefined;
+  if (config.retentionEnabled) {
+    const { startRunDataRetention } = await import("./services/run-data-retention.js");
+    stopRunDataRetention = startRunDataRetention(db, config);
+    logger.info(
+      {
+        intervalMinutes: config.retentionIntervalMinutes,
+        retentionEnabled: true,
+      },
+      "Run data retention enabled",
+    );
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -736,6 +750,8 @@ export async function startServer(): Promise<StartedServer> {
   
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      stopRunDataRetention?.();
+
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
         telemetryClient.stop();

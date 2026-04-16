@@ -13,6 +13,7 @@ export {
   storageS3ConfigSchema,
   secretsConfigSchema,
   secretsLocalEncryptedConfigSchema,
+  retentionConfigSchema,
   type PaperclipConfig,
   type LlmConfig,
   type DatabaseBackupConfig,
@@ -27,4 +28,5 @@ export {
   type SecretsConfig,
   type SecretsLocalEncryptedConfig,
   type ConfigMeta,
+  type RetentionConfig,
 } from "../../../packages/shared/src/config-schema.js";

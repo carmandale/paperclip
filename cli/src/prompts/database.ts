@@ -19,6 +19,14 @@ export async function promptDatabase(current?: DatabaseConfig): Promise<Database
       intervalMinutes: 60,
       retentionDays: 30,
       dir: defaultBackupDir,
+      excludeTables: [
+        "heartbeat_runs",
+        "heartbeat_run_events",
+        "agent_wakeup_requests",
+        "cost_events",
+        "activity_log",
+        "finance_events",
+      ],
     },
   };
 
@@ -152,6 +160,7 @@ export async function promptDatabase(current?: DatabaseConfig): Promise<Database
       intervalMinutes: Number(backupIntervalInput || "60"),
       retentionDays: Number(backupRetentionInput || "30"),
       dir: backupDirInput || defaultBackupDir,
+      excludeTables: base.backup.excludeTables,
     },
   };
 }

@@ -70,11 +70,13 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
   const spinner = p.spinner();
   spinner.start("Creating database backup...");
   try {
+    const excludeTables = config?.database.backup.excludeTables;
     const result = await runDatabaseBackup({
       connectionString: connection.value,
       backupDir,
       retentionDays,
       filenamePrefix,
+      ...(excludeTables ? { excludeTables } : {}),
     });
     spinner.stop(`Backup saved: ${formatDatabaseBackupResult(result)}`);
 

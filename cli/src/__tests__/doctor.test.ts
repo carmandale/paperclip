@@ -28,6 +28,14 @@ function createTempConfig(): string {
         intervalMinutes: 60,
         retentionDays: 30,
         dir: path.join(runtimeRoot, "backups"),
+        excludeTables: [
+          "heartbeat_runs",
+          "heartbeat_run_events",
+          "agent_wakeup_requests",
+          "cost_events",
+          "activity_log",
+          "finance_events",
+        ],
       },
     },
     logging: {
@@ -48,6 +56,17 @@ function createTempConfig(): string {
     },
     telemetry: {
       enabled: true,
+    },
+    retention: {
+      enabled: true,
+      intervalMinutes: 60,
+      heartbeatRunEventsDays: 7,
+      heartbeatRunsDays: 14,
+      agentWakeupRequestsDays: 14,
+      activityLogDays: 30,
+      costEventsDays: 90,
+      financeEventsDays: 90,
+      runLogFilesDays: 14,
     },
     storage: {
       provider: "local_disk",

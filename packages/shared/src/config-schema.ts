@@ -23,6 +23,26 @@ export const databaseBackupConfigSchema = z.object({
   intervalMinutes: z.number().int().min(1).max(7 * 24 * 60).default(60),
   retentionDays: z.number().int().min(1).max(3650).default(30),
   dir: z.string().default("~/.paperclip/instances/default/data/backups"),
+  excludeTables: z.array(z.string()).default([
+    "heartbeat_runs",
+    "heartbeat_run_events",
+    "agent_wakeup_requests",
+    "cost_events",
+    "activity_log",
+    "finance_events",
+  ]),
+});
+
+export const retentionConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  intervalMinutes: z.number().int().min(1).max(24 * 60).default(60),
+  heartbeatRunEventsDays: z.number().int().min(1).default(7),
+  heartbeatRunsDays: z.number().int().min(1).default(14),
+  agentWakeupRequestsDays: z.number().int().min(1).default(14),
+  activityLogDays: z.number().int().min(1).default(30),
+  costEventsDays: z.number().int().min(1).default(90),
+  financeEventsDays: z.number().int().min(1).default(90),
+  runLogFilesDays: z.number().int().min(1).default(14),
 });
 
 export const databaseConfigSchema = z.object({
@@ -130,6 +150,7 @@ export const paperclipConfigSchema = z
         keyFilePath: "~/.paperclip/instances/default/secrets/master.key",
       },
     }),
+    retention: retentionConfigSchema.default({}),
   })
   .superRefine((value, ctx) => {
     if (value.server.deploymentMode === "local_trusted") {
@@ -182,3 +203,4 @@ export type AuthConfig = z.infer<typeof authConfigSchema>;
 export type TelemetryConfig = z.infer<typeof telemetryConfigSchema>;
 export type ConfigMeta = z.infer<typeof configMetaSchema>;
 export type DatabaseBackupConfig = z.infer<typeof databaseBackupConfigSchema>;
+export type RetentionConfig = z.infer<typeof retentionConfigSchema>;

@@ -174,6 +174,14 @@ function quickstartDefaultsFromEnv(): {
         intervalMinutes: databaseBackupIntervalMinutes,
         retentionDays: databaseBackupRetentionDays,
         dir: resolvePathFromEnv(process.env.PAPERCLIP_DB_BACKUP_DIR) ?? resolveDefaultBackupDir(instanceId),
+        excludeTables: [
+          "heartbeat_runs",
+          "heartbeat_run_events",
+          "agent_wakeup_requests",
+          "cost_events",
+          "activity_log",
+          "finance_events",
+        ],
       },
     },
     logging: {
@@ -498,6 +506,17 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     auth,
     telemetry: {
       enabled: true,
+    },
+    retention: {
+      enabled: true,
+      intervalMinutes: 60,
+      heartbeatRunEventsDays: 7,
+      heartbeatRunsDays: 14,
+      agentWakeupRequestsDays: 14,
+      activityLogDays: 30,
+      costEventsDays: 90,
+      financeEventsDays: 90,
+      runLogFilesDays: 14,
     },
     storage,
     secrets,

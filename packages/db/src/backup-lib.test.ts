@@ -176,4 +176,88 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     },
     60_000,
   );
+
+  it(
+    "excludeTables omits specified tables from backup output",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_exclude_target",
+      );
+      const backupDir = createTempDir("paperclip-db-exclude-output-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        // Create two tables: one to include, one to exclude
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."keep_me" (
+            "id" serial PRIMARY KEY,
+            "value" text NOT NULL
+          );
+        `);
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."drop_me" (
+            "id" serial PRIMARY KEY,
+            "value" text NOT NULL
+          );
+        `);
+
+        // Insert data into both
+        for (let i = 0; i < 5; i++) {
+          await sourceSql`INSERT INTO "public"."keep_me" ("value") VALUES (${`keep-${i}`})`;
+          await sourceSql`INSERT INTO "public"."drop_me" ("value") VALUES (${`drop-${i}`})`;
+        }
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retentionDays: 7,
+          filenamePrefix: "paperclip-exclude-test",
+          excludeTables: ["drop_me"],
+        });
+
+        expect(fs.existsSync(result.backupFile)).toBe(true);
+
+        // Verify the backup SQL does not contain INSERT for excluded table
+        const backupContent = fs.readFileSync(result.backupFile, "utf8");
+        expect(backupContent).toContain("keep_me");
+        expect(backupContent).not.toMatch(/INSERT INTO.*drop_me/);
+
+        // Restore and verify only keep_me has data
+        await restoreSql.unsafe(`
+          CREATE TABLE "public"."keep_me" (
+            "id" serial PRIMARY KEY,
+            "value" text NOT NULL
+          );
+        `);
+        await restoreSql.unsafe(`
+          CREATE TABLE "public"."drop_me" (
+            "id" serial PRIMARY KEY,
+            "value" text NOT NULL
+          );
+        `);
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const keepCount = await restoreSql.unsafe<{ count: number }[]>(
+          `SELECT count(*)::int AS count FROM "public"."keep_me"`,
+        );
+        expect(keepCount[0]?.count).toBe(5);
+
+        const dropCount = await restoreSql.unsafe<{ count: number }[]>(
+          `SELECT count(*)::int AS count FROM "public"."drop_me"`,
+        );
+        expect(dropCount[0]?.count).toBe(0);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
 });

@@ -11,6 +11,7 @@ type PartialConfig = {
     backup?: {
       dir?: string;
       retentionDays?: number;
+      excludeTables?: string[];
     };
   };
 };
@@ -100,11 +101,23 @@ async function main() {
   console.log(`Retention window: ${retentionDays} day(s)`);
 
   try {
+    const excludeTablesFromEnv = process.env.PAPERCLIP_DB_BACKUP_EXCLUDE_TABLES;
+    const excludeTables: string[] = excludeTablesFromEnv
+      ? excludeTablesFromEnv.split(",").map((t) => t.trim()).filter(Boolean)
+      : (config?.database?.backup?.excludeTables ?? [
+          "heartbeat_runs",
+          "heartbeat_run_events",
+          "agent_wakeup_requests",
+          "cost_events",
+          "activity_log",
+          "finance_events",
+        ]);
     const result = await runDatabaseBackup({
       connectionString,
       backupDir,
       retentionDays,
       filenamePrefix: "paperclip",
+      excludeTables,
     });
 
     console.log(`Backup saved: ${formatDatabaseBackupResult(result)}`);
