@@ -177,3 +177,24 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
     /no conversation found with session id|unknown session|session .* not found/i.test(msg),
   );
 }
+
+/**
+ * Detect session corruption: a 400 error where a `tool_result` message
+ * references a `tool_use_id` that has no corresponding `tool_use` in the
+ * conversation. This is the signature of ENOSPC or other write failures
+ * that orphan a tool_result without its paired tool_use.
+ *
+ * Detection pattern: error messages containing both "tool_use_id" and
+ * "tool_result" — indicating the API rejected the conversation because
+ * a tool_result was not preceded by its tool_use.
+ */
+export function isClaudeCorruptionError(parsed: Record<string, unknown>): boolean {
+  const resultText = asString(parsed.result, "").trim();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  return allMessages.some((msg) =>
+    /tool_use_id/.test(msg) && /tool_result/.test(msg),
+  );
+}

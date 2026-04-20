@@ -30,6 +30,7 @@ import {
   detectClaudeLoginRequired,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeCorruptionError,
 } from "./parse.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 
@@ -392,9 +393,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
+  const runtimeSessionWorkspaceId = asString(runtimeSessionParams.workspaceId, "");
   const canResumeSession =
     runtimeSessionId.length > 0 &&
-    (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(cwd));
+    (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(cwd)) &&
+    (runtimeSessionWorkspaceId.length === 0 || runtimeSessionWorkspaceId === (workspaceId ?? ""));
   const sessionId = canResumeSession ? runtimeSessionId : null;
   if (runtimeSessionId && !canResumeSession) {
     await onLog(
@@ -600,6 +603,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
+
+    // Corruption detection: when a tool_result is orphaned (no paired tool_use),
+    // the API returns a 400 containing both "tool_use_id" and "tool_result".
+    // Retry without --resume — same pattern as unknown-session retry.
+    const isCorruption =
+      sessionId &&
+      !initial.proc.timedOut &&
+      (initial.proc.exitCode ?? 0) !== 0 &&
+      initial.parsed &&
+      isClaudeCorruptionError(initial.parsed);
+
     if (
       sessionId &&
       !initial.proc.timedOut &&
@@ -609,10 +623,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ) {
       await onLog(
         "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.
+`,
       );
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+    }
+
+    if (isCorruption) {
+      await onLog(
+        "stdout",
+        `[paperclip] Session corruption detected in session ${sessionId} — retrying without --resume (error_class: session_corruption)\n`,
+      );
+      const retry = await runAttempt(null);
+      const retryResult = toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+
+      // Always set clearSession on corruption detection + failed fresh retry,
+      // even if a partial session ID was emitted.
+      const retryOutcome = (retry.proc.exitCode ?? 0) === 0 ? "success" : "failure";
+      if (retryOutcome === "failure") {
+        retryResult.clearSession = true;
+      }
+
+      // Add corruption_recovery to resultJson for queryability (R1.5)
+      retryResult.resultJson = {
+        ...(retryResult.resultJson instanceof Object ? retryResult.resultJson : {}),
+        corruption_recovery: {
+          detected: true,
+          original_session_id: sessionId,
+          retry_outcome: retryOutcome,
+        },
+      };
+
+      // Set structured errorCode if not already set
+      if (!retryResult.errorCode) {
+        retryResult.errorCode = "session_corruption";
+      }
+
+      return retryResult;
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
