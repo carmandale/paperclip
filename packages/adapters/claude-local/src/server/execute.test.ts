@@ -229,6 +229,41 @@ describe("execute corruption recovery", () => {
     });
   });
 
+  it("preserves a more specific terminal error code after a failed fresh retry", async () => {
+    mockRunChildProcess
+      .mockResolvedValueOnce(makeProc({ exitCode: 1, stdout: "corrupt-run" }))
+      .mockResolvedValueOnce(makeProc({ exitCode: 1, stdout: "fresh-run" }));
+    mockParseClaudeStreamJson
+      .mockReturnValueOnce(makeParsedStream({
+        resultJson: { result: "unexpected `tool_use_id` found in `tool_result` blocks" },
+        summary: "",
+        sessionId: "session-old",
+      }))
+      .mockReturnValueOnce(makeParsedStream({
+        resultJson: { result: "Login required" },
+        summary: "Login required",
+        sessionId: "session-partial",
+      }));
+    mockDetectClaudeLoginRequired
+      .mockReturnValueOnce({ requiresLogin: true, loginUrl: "https://example.com/login" });
+    mockIsClaudeCorruptionError.mockReturnValueOnce(true).mockReturnValueOnce(false);
+
+    const result = await execute(makeContext());
+
+    expect(result.clearSession).toBe(true);
+    expect(result.errorCode).toBe("claude_auth_required");
+    expect(result.errorMeta).toMatchObject({
+      loginUrl: "https://example.com/login",
+    });
+    expect(result.resultJson).toMatchObject({
+      corruption_recovery: {
+        detected: true,
+        original_session_id: "session-old",
+        retry_outcome: "failure",
+      },
+    });
+  });
+
   it("does not resume a saved session when the workspace id changed", async () => {
     mockRunChildProcess.mockResolvedValueOnce(makeProc({ exitCode: 0, stdout: "fresh-run" }));
     mockParseClaudeStreamJson.mockReturnValueOnce(makeParsedStream({
