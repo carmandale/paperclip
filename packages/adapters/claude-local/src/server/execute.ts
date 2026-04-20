@@ -402,7 +402,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (runtimeSessionId && !canResumeSession) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
+      `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" / workspace "${runtimeSessionWorkspaceId || "unknown"}" and will not be resumed in cwd "${cwd}" / workspace "${workspaceId ?? "unknown"}".\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");

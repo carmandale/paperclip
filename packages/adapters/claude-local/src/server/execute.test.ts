@@ -1,76 +1,268 @@
-import { describe, expect, it } from "vitest";
-import { isClaudeCorruptionError, isClaudeUnknownSessionError } from "./parse.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 
-describe("corruption vs unknown-session detection", () => {
-  it("corruption and unknown-session are mutually exclusive in practice", () => {
-    // Corruption signature: tool_use_id + tool_result
-    const corruptionParsed = {
-      subtype: "error",
-      result: "messages with tool_use_id must be preceded by a tool_use message in tool_result",
-      errors: [],
-    };
-    expect(isClaudeCorruptionError(corruptionParsed)).toBe(true);
-    expect(isClaudeUnknownSessionError(corruptionParsed)).toBe(false);
+const {
+  mockRunChildProcess,
+  mockParseClaudeStreamJson,
+  mockDescribeClaudeFailure,
+  mockDetectClaudeLoginRequired,
+  mockIsClaudeCorruptionError,
+  mockIsClaudeMaxTurnsResult,
+  mockIsClaudeUnknownSessionError,
+  mockResolveClaudeDesiredSkillNames,
+} = vi.hoisted(() => ({
+  mockRunChildProcess: vi.fn(),
+  mockParseClaudeStreamJson: vi.fn(),
+  mockDescribeClaudeFailure: vi.fn(),
+  mockDetectClaudeLoginRequired: vi.fn(),
+  mockIsClaudeCorruptionError: vi.fn(),
+  mockIsClaudeMaxTurnsResult: vi.fn(),
+  mockIsClaudeUnknownSessionError: vi.fn(),
+  mockResolveClaudeDesiredSkillNames: vi.fn(),
+}));
 
-    // Unknown session signature: no conversation found
-    const unknownParsed = {
-      subtype: "error",
-      result: "no conversation found with session id abc123",
-      errors: [],
-    };
-    expect(isClaudeCorruptionError(unknownParsed)).toBe(false);
-    expect(isClaudeUnknownSessionError(unknownParsed)).toBe(true);
-  });
-
-  it("both detectors return false for generic errors", () => {
-    const genericParsed = {
-      subtype: "error",
-      result: "internal server error",
-      errors: [],
-    };
-    expect(isClaudeCorruptionError(genericParsed)).toBe(false);
-    expect(isClaudeUnknownSessionError(genericParsed)).toBe(false);
-  });
+vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
+  return {
+    ...actual,
+    buildPaperclipEnv: () => ({}),
+    readPaperclipRuntimeSkillEntries: async () => [],
+    joinPromptSections: (parts: Array<string | null | undefined>) => parts.filter(Boolean).join("\n\n"),
+    buildInvocationEnvForLogs: () => ({}),
+    ensureAbsoluteDirectory: async () => {},
+    ensureCommandResolvable: async () => {},
+    ensurePathInEnv: (env: Record<string, string>) => env,
+    resolveCommandForLogs: async (command: string) => command,
+    renderTemplate: (template: string) => template,
+    renderPaperclipWakePrompt: () => "",
+    stringifyPaperclipWakePayload: () => "",
+    runChildProcess: mockRunChildProcess,
+  };
 });
 
-describe("corruption recovery result structure", () => {
-  it("corruption_recovery result structure matches R1.5 contract", () => {
-    // Verify the expected structure that the execute() function will produce
-    // when corruption is detected. This is a contract test.
-    const expectedRecovery = {
-      detected: true,
-      original_session_id: "session-abc",
-      retry_outcome: "failure" as const,
-    };
+vi.mock("./parse.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./parse.js")>();
+  return {
+    ...actual,
+    parseClaudeStreamJson: mockParseClaudeStreamJson,
+    describeClaudeFailure: mockDescribeClaudeFailure,
+    detectClaudeLoginRequired: mockDetectClaudeLoginRequired,
+    isClaudeCorruptionError: mockIsClaudeCorruptionError,
+    isClaudeMaxTurnsResult: mockIsClaudeMaxTurnsResult,
+    isClaudeUnknownSessionError: mockIsClaudeUnknownSessionError,
+  };
+});
 
-    expect(expectedRecovery.detected).toBe(true);
-    expect(expectedRecovery.original_session_id).toBe("session-abc");
-    expect(expectedRecovery.retry_outcome).toBe("failure");
+vi.mock("./skills.js", () => ({
+  resolveClaudeDesiredSkillNames: mockResolveClaudeDesiredSkillNames,
+}));
+
+import { execute } from "./execute.js";
+
+function makeProc(overrides: Partial<RunProcessResult> = {}): RunProcessResult {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "{}",
+    stderr: "",
+    pid: 123,
+    startedAt: "2026-04-20T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeParsedStream(overrides: Record<string, unknown> = {}) {
+  return {
+    resultJson: { result: "ok" },
+    summary: "ok",
+    sessionId: null,
+    model: "claude-sonnet-4-6",
+    costUsd: 0,
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      cachedInputTokens: 0,
+    },
+    ...overrides,
+  };
+}
+
+function makeContext(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+  return {
+    runId: "run-123",
+    agent: {
+      id: "agent-123",
+      companyId: "company-123",
+      name: "CRO",
+      adapterType: "claude_local",
+      adapterConfig: {},
+    },
+    runtime: {
+      sessionId: "session-old",
+      sessionParams: {
+        sessionId: "session-old",
+        cwd: "/tmp/operator",
+        workspaceId: "workspace-current",
+      },
+      sessionDisplayId: "session-old",
+      taskKey: "__heartbeat__",
+    },
+    config: {
+      command: "/bin/echo",
+      cwd: "/tmp/operator",
+      model: "claude-sonnet-4-6",
+      dangerouslySkipPermissions: true,
+      timeoutSec: 30,
+      graceSec: 5,
+    },
+    context: {
+      paperclipWorkspace: {
+        cwd: "/tmp/operator",
+        workspaceId: "workspace-current",
+        repoUrl: "https://example.com/repo.git",
+        repoRef: "main",
+      },
+    },
+    onLog: async () => {},
+    ...overrides,
+  };
+}
+
+describe("execute corruption recovery", () => {
+  beforeEach(() => {
+    mockRunChildProcess.mockReset();
+    mockParseClaudeStreamJson.mockReset();
+    mockDescribeClaudeFailure.mockReset().mockReturnValue("Claude failed");
+    mockDetectClaudeLoginRequired.mockReset().mockReturnValue({
+      requiresLogin: false,
+      loginUrl: null,
+    });
+    mockIsClaudeCorruptionError.mockReset().mockReturnValue(false);
+    mockIsClaudeMaxTurnsResult.mockReset().mockReturnValue(false);
+    mockIsClaudeUnknownSessionError.mockReset().mockReturnValue(false);
+    mockResolveClaudeDesiredSkillNames.mockReset().mockReturnValue([]);
   });
 
-  it("clearSession is set on failed fresh retry after corruption", () => {
-    // Contract: when retry_outcome === "failure", clearSession MUST be true
-    // even if a partial session ID was emitted by the fresh retry.
-    const retryOutcome: string = "failure";
-    const clearSession = retryOutcome === "failure";
-    expect(clearSession).toBe(true);
+  it("retries without --resume and replaces the saved session on corruption recovery success", async () => {
+    mockRunChildProcess
+      .mockResolvedValueOnce(makeProc({ exitCode: 1, stdout: "corrupt-run" }))
+      .mockResolvedValueOnce(makeProc({ exitCode: 0, stdout: "fresh-run" }));
+    mockParseClaudeStreamJson
+      .mockReturnValueOnce(makeParsedStream({
+        resultJson: { result: "unexpected `tool_use_id` found in `tool_result` blocks" },
+        summary: "",
+        sessionId: "session-old",
+      }))
+      .mockReturnValueOnce(makeParsedStream({
+        resultJson: { result: "Recovered" },
+        summary: "Recovered",
+        sessionId: "session-new",
+      }));
+    mockIsClaudeCorruptionError.mockReturnValueOnce(true).mockReturnValueOnce(false);
+
+    const onLog = vi.fn(async () => {});
+    const result = await execute(makeContext({ onLog }));
+
+    expect(mockRunChildProcess).toHaveBeenCalledTimes(2);
+    const firstArgs = mockRunChildProcess.mock.calls[0][2] as string[];
+    const secondArgs = mockRunChildProcess.mock.calls[1][2] as string[];
+    expect(firstArgs).toContain("--resume");
+    expect(firstArgs[firstArgs.indexOf("--resume") + 1]).toBe("session-old");
+    expect(secondArgs).not.toContain("--resume");
+
+    expect(onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("Session corruption detected in session session-old"),
+    );
+    expect(result.sessionId).toBe("session-new");
+    expect(result.clearSession).toBe(false);
+    expect(result.errorCode).toBeNull();
+    expect(result.resultJson).toMatchObject({
+      result: "Recovered",
+      corruption_recovery: {
+        detected: true,
+        original_session_id: "session-old",
+        retry_outcome: "success",
+      },
+    });
+    expect(result.sessionParams).toMatchObject({
+      sessionId: "session-new",
+      cwd: "/tmp/operator",
+      workspaceId: "workspace-current",
+      repoUrl: "https://example.com/repo.git",
+      repoRef: "main",
+    });
   });
 
-  it("errorCode is session_corruption on failed retry, null on success", () => {
-    // Contract: on corruption + failed fresh retry, errorCode = session_corruption
-    // On corruption + successful fresh retry, errorCode = null (no error)
-    const failureErrorCode = "session_corruption";
-    const successErrorCode = null;
+  it("forces clearSession and preserves the terminal failure mode after a failed fresh retry", async () => {
+    mockRunChildProcess
+      .mockResolvedValueOnce(makeProc({ exitCode: 1, stdout: "corrupt-run" }))
+      .mockResolvedValueOnce(makeProc({ exitCode: 1, stdout: "fresh-run" }));
+    mockParseClaudeStreamJson
+      .mockReturnValueOnce(makeParsedStream({
+        resultJson: { result: "unexpected `tool_use_id` found in `tool_result` blocks" },
+        summary: "",
+        sessionId: "session-old",
+      }))
+      .mockReturnValueOnce(makeParsedStream({
+        resultJson: { result: "Still broken" },
+        summary: "Still broken",
+        sessionId: "session-partial",
+      }));
+    mockIsClaudeCorruptionError.mockReturnValueOnce(true).mockReturnValueOnce(false);
 
-    expect(failureErrorCode).toBe("session_corruption");
-    expect(successErrorCode).toBeNull();
+    const result = await execute(makeContext());
+
+    expect(mockRunChildProcess).toHaveBeenCalledTimes(2);
+    expect(result.sessionId).toBe("session-partial");
+    expect(result.clearSession).toBe(true);
+    expect(result.errorCode).toBe("session_corruption");
+    expect(result.resultJson).toMatchObject({
+      result: "Still broken",
+      corruption_recovery: {
+        detected: true,
+        original_session_id: "session-old",
+        retry_outcome: "failure",
+      },
+    });
   });
 
-  it("corruption_recovery.retry_outcome is 'success' when fresh retry succeeds", () => {
-    const retryOutcome: string = "success";
-    expect(retryOutcome).toBe("success");
-    // On success: clearSession is NOT forced to true
-    const clearSession = retryOutcome === "failure";
-    expect(clearSession).toBe(false);
+  it("does not resume a saved session when the workspace id changed", async () => {
+    mockRunChildProcess.mockResolvedValueOnce(makeProc({ exitCode: 0, stdout: "fresh-run" }));
+    mockParseClaudeStreamJson.mockReturnValueOnce(makeParsedStream({
+      resultJson: { result: "Fresh workspace run" },
+      summary: "Fresh workspace run",
+      sessionId: "session-fresh",
+    }));
+
+    const onLog = vi.fn(async () => {});
+    const result = await execute(makeContext({
+      runtime: {
+        sessionId: "session-old",
+        sessionParams: {
+          sessionId: "session-old",
+          cwd: "/tmp/operator",
+          workspaceId: "workspace-stale",
+        },
+        sessionDisplayId: "session-old",
+        taskKey: "__heartbeat__",
+      },
+      onLog,
+    }));
+
+    expect(mockRunChildProcess).toHaveBeenCalledTimes(1);
+    const args = mockRunChildProcess.mock.calls[0][2] as string[];
+    expect(args).not.toContain("--resume");
+    expect(onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining('workspace "workspace-stale"'),
+    );
+    expect(onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining('workspace "workspace-current"'),
+    );
+    expect(result.sessionId).toBe("session-fresh");
   });
 });

@@ -1,5 +1,11 @@
+import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 import { isClaudeCorruptionError, isClaudeUnknownSessionError, parseClaudeStreamJson } from "./parse.js";
+
+const incidentFixture = fs.readFileSync(
+  new URL("./__fixtures__/session-corruption-error.txt", import.meta.url),
+  "utf8",
+).trim();
 
 describe("isClaudeCorruptionError", () => {
   it("detects corruption when both tool_use_id and tool_result appear in result", () => {
@@ -59,11 +65,9 @@ describe("isClaudeCorruptionError", () => {
   });
 
   it("detects corruption with ENOSPC incident signature", () => {
-    // Real signature from the operator-1l4 incident
     const parsed = {
       subtype: "error",
-      result:
-        'Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"tool_result: messages with tool_use_id must be preceded by a tool_use message"}}',
+      result: incidentFixture,
       errors: [],
     };
     expect(isClaudeCorruptionError(parsed)).toBe(true);
