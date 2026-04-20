@@ -86,9 +86,8 @@ describe("isClaudeUnknownSessionError", () => {
       result: "tool_result for tool_use_id must be preceded by tool_use",
       errors: [],
     };
-    // This contains "tool_result" but NOT "tool_use_id" — wait, it does
-    // Actually "tool_use_id" IS in this string. But it also has "tool_result",
-    // so isClaudeCorruptionError would be true. This test verifies the
+    // This string contains both tool_use_id and tool_result, so
+    // isClaudeCorruptionError would be true. This test verifies the
     // unknown-session detector doesn't false-positive on corruption.
     expect(isClaudeUnknownSessionError(parsed)).toBe(false);
   });

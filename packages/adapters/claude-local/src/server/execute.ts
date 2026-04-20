@@ -623,8 +623,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ) {
       await onLog(
         "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.
-`,
+        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
@@ -643,6 +642,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const retryOutcome = (retry.proc.exitCode ?? 0) === 0 ? "success" : "failure";
       if (retryOutcome === "failure") {
         retryResult.clearSession = true;
+        // Set structured errorCode on failure — per T3, errorCode reflects
+        // the terminal failure mode. On corruption + failure, that's
+        // session_corruption. On success, errorCode is null (no error).
+        if (!retryResult.errorCode) {
+          retryResult.errorCode = "session_corruption";
+        }
       }
 
       // Add corruption_recovery to resultJson for queryability (R1.5)
@@ -654,11 +659,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           retry_outcome: retryOutcome,
         },
       };
-
-      // Set structured errorCode if not already set
-      if (!retryResult.errorCode) {
-        retryResult.errorCode = "session_corruption";
-      }
 
       return retryResult;
     }
