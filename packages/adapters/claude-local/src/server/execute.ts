@@ -630,9 +630,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (isCorruption) {
+      const corruptionDetectedAt = new Date().toISOString();
+      const corruptionErrorSignature = "tool_result_without_tool_use";
       await onLog(
         "stdout",
-        `[paperclip] Session corruption detected in session ${sessionId} — retrying without --resume (error_class: session_corruption)\n`,
+        `[paperclip] Session corruption detected in session ${sessionId} — retrying without --resume (error_class: session_corruption, error_signature: ${corruptionErrorSignature}, detected_at: ${corruptionDetectedAt})\n`,
       );
       const retry = await runAttempt(null);
       const retryResult = toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
@@ -657,6 +659,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           detected: true,
           original_session_id: sessionId,
           retry_outcome: retryOutcome,
+          error_signature: corruptionErrorSignature,
+          detected_at: corruptionDetectedAt,
         },
       };
 

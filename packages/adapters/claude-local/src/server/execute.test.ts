@@ -185,8 +185,12 @@ describe("execute corruption recovery", () => {
         detected: true,
         original_session_id: "session-old",
         retry_outcome: "success",
+        error_signature: "tool_result_without_tool_use",
+        detected_at: expect.any(String),
       },
     });
+    const recovery = result.resultJson?.corruption_recovery as Record<string, unknown>;
+    expect(Date.parse(String(recovery.detected_at))).not.toBeNaN();
     expect(result.sessionParams).toMatchObject({
       sessionId: "session-new",
       cwd: "/tmp/operator",
@@ -225,8 +229,12 @@ describe("execute corruption recovery", () => {
         detected: true,
         original_session_id: "session-old",
         retry_outcome: "failure",
+        error_signature: "tool_result_without_tool_use",
+        detected_at: expect.any(String),
       },
     });
+    const recovery = result.resultJson?.corruption_recovery as Record<string, unknown>;
+    expect(Date.parse(String(recovery.detected_at))).not.toBeNaN();
   });
 
   it("preserves a more specific terminal error code after a failed fresh retry", async () => {
@@ -260,6 +268,8 @@ describe("execute corruption recovery", () => {
         detected: true,
         original_session_id: "session-old",
         retry_outcome: "failure",
+        error_signature: "tool_result_without_tool_use",
+        detected_at: expect.any(String),
       },
     });
   });
