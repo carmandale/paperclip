@@ -11,6 +11,7 @@ import {
   routineRuns,
   routines,
   routineTriggers,
+  standupPolicies,
 } from "@paperclipai/db";
 import type {
   CreateRoutine,
@@ -41,6 +42,7 @@ import { parseCron, validateCron } from "./cron.js";
 import { heartbeatService } from "./heartbeat.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import { standupService } from "./standups.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"];
@@ -291,10 +293,24 @@ function mergeRoutineRunPayload(
   };
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return isPlainRecord(value) ? value : {};
+}
+
+function nonEmptyRecordOr(value: unknown, fallback: Record<string, unknown>) {
+  const record = asRecord(value);
+  return Object.keys(record).length > 0 ? record : fallback;
+}
+
+function optionalString(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
 export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
   const issueSvc = issueService(db);
   const secretsSvc = secretService(db);
   const heartbeat = deps.heartbeat ?? heartbeatService(db);
+  const standupSvc = standupService(db);
 
   async function getRoutineById(id: string) {
     return db
@@ -663,6 +679,191 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
     return value;
   }
 
+  async function getLinkedStandupPolicy(routine: typeof routines.$inferSelect) {
+    return db
+      .select()
+      .from(standupPolicies)
+      .where(
+        and(
+          eq(standupPolicies.companyId, routine.companyId),
+          eq(standupPolicies.linkedRoutineId, routine.id),
+          eq(standupPolicies.status, "active"),
+        ),
+      )
+      .orderBy(desc(standupPolicies.version), desc(standupPolicies.updatedAt), desc(standupPolicies.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function createRoutineStandupServiceRun(input: {
+    routine: typeof routines.$inferSelect;
+    trigger: typeof routineTriggers.$inferSelect | null;
+    source: "schedule" | "manual" | "api" | "webhook";
+    routineRunId: string;
+    triggeredAt: Date;
+  }) {
+    const [serviceRun] = await db
+      .insert(heartbeatRuns)
+      .values({
+        companyId: input.routine.companyId,
+        agentId: input.routine.assigneeAgentId,
+        invocationSource: "routine_standup",
+        triggerDetail: input.source,
+        status: "completed",
+        startedAt: input.triggeredAt,
+        finishedAt: input.triggeredAt,
+        contextSnapshot: {
+          routineId: input.routine.id,
+          routineRunId: input.routineRunId,
+          triggerId: input.trigger?.id ?? null,
+          source: input.source,
+        },
+      })
+      .returning({ id: heartbeatRuns.id });
+    return serviceRun.id;
+  }
+
+  async function dispatchStandupRoutineRun(
+    input: {
+      routine: typeof routines.$inferSelect;
+      trigger: typeof routineTriggers.$inferSelect | null;
+      source: "schedule" | "manual" | "api" | "webhook";
+      payload?: Record<string, unknown> | null;
+      idempotencyKey?: string | null;
+    },
+    policy: typeof standupPolicies.$inferSelect,
+  ) {
+    const claim = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
+      );
+
+      if (input.idempotencyKey) {
+        const existing = await txDb
+          .select()
+          .from(routineRuns)
+          .where(
+            and(
+              eq(routineRuns.companyId, input.routine.companyId),
+              eq(routineRuns.routineId, input.routine.id),
+              eq(routineRuns.source, input.source),
+              eq(routineRuns.idempotencyKey, input.idempotencyKey),
+              input.trigger ? eq(routineRuns.triggerId, input.trigger.id) : isNull(routineRuns.triggerId),
+            ),
+          )
+          .orderBy(desc(routineRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) return { run: existing, existing: true, nextRunAt: undefined, triggeredAt: existing.triggeredAt };
+      }
+
+      const triggeredAt = new Date();
+      const [createdRun] = await txDb
+        .insert(routineRuns)
+        .values({
+          companyId: input.routine.companyId,
+          routineId: input.routine.id,
+          triggerId: input.trigger?.id ?? null,
+          source: input.source,
+          status: "received",
+          triggeredAt,
+          idempotencyKey: input.idempotencyKey ?? null,
+          triggerPayload: input.payload ?? null,
+        })
+        .returning();
+
+      const nextRunAt = input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
+        ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
+        : undefined;
+
+      return { run: createdRun, existing: false, nextRunAt, triggeredAt };
+    });
+
+    if (claim.existing) return claim.run;
+
+    const payload = asRecord(input.payload);
+    const serviceRunId = optionalString(payload.serviceRunId) ?? await createRoutineStandupServiceRun({
+      routine: input.routine,
+      trigger: input.trigger,
+      source: input.source,
+      routineRunId: claim.run.id,
+      triggeredAt: claim.triggeredAt,
+    });
+    const scheduledFor = input.trigger?.nextRunAt?.toISOString() ?? null;
+    const triggerConditionSnapshot = nonEmptyRecordOr(payload.triggerConditionSnapshot, {
+      source: "routine",
+      routineId: input.routine.id,
+      routineRunId: claim.run.id,
+      triggerId: input.trigger?.id ?? null,
+      triggerSource: input.source,
+      scheduledFor,
+      missedRunRecovered: input.source === "schedule" && !!input.trigger?.nextRunAt && input.trigger.nextRunAt < claim.triggeredAt,
+    });
+    const assessmentSnapshot = nonEmptyRecordOr(payload.assessmentSnapshot, {
+      source: "routine",
+      status: "assessment_missing",
+    });
+
+    try {
+      const inspection = await standupSvc.fireStandup(input.routine.companyId, {
+        policyKey: policy.policyKey,
+        standupType: policy.standupType,
+        localDate: optionalString(payload.localDate),
+        idempotencyKey: input.idempotencyKey ?? undefined,
+        routineId: input.routine.id,
+        triggerId: input.trigger?.id ?? null,
+        routineRunId: claim.run.id,
+        triggerSource: input.source,
+        triggerConditionSnapshot,
+        assessmentSnapshot,
+        manualTriggerReceipt: {
+          source: input.source,
+          routineId: input.routine.id,
+          routineRunId: claim.run.id,
+          triggerId: input.trigger?.id ?? null,
+          idempotencyKey: input.idempotencyKey ?? null,
+        },
+        serviceRunId,
+      });
+      const linkedIssueId = inspection.session?.standupIssueId ?? null;
+      const status = inspection.standup_forced && linkedIssueId ? "issue_created" : "failed";
+      const failureReason = status === "failed"
+        ? inspection.session?.failureReason ?? `standup_fire_missing:${inspection.missing_evidence.join(",") || "standup_forced"}`
+        : null;
+      const updated = await finalizeRun(claim.run.id, {
+        status,
+        linkedIssueId,
+        failureReason,
+        completedAt: status === "failed" ? new Date() : null,
+      });
+      await updateRoutineTouchedState({
+        routineId: input.routine.id,
+        triggerId: input.trigger?.id ?? null,
+        triggeredAt: claim.triggeredAt,
+        status,
+        issueId: linkedIssueId,
+        nextRunAt: claim.nextRunAt,
+      });
+      return updated ?? claim.run;
+    } catch (error) {
+      const failureReason = error instanceof Error ? error.message : String(error);
+      const failed = await finalizeRun(claim.run.id, {
+        status: "failed",
+        failureReason,
+        completedAt: new Date(),
+      });
+      await updateRoutineTouchedState({
+        routineId: input.routine.id,
+        triggerId: input.trigger?.id ?? null,
+        triggeredAt: claim.triggeredAt,
+        status: "failed",
+        nextRunAt: claim.nextRunAt,
+      });
+      return failed ?? claim.run;
+    }
+  }
+
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect | null;
@@ -675,8 +876,13 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
     executionWorkspaceSettings?: Record<string, unknown> | null;
   }) {
     const resolvedVariables = resolveRoutineVariableValues(input.routine.variables ?? [], input);
-    const description = interpolateRoutineTemplate(input.routine.description, resolvedVariables);
     const triggerPayload = mergeRoutineRunPayload(input.payload, resolvedVariables);
+    const linkedStandupPolicy = await getLinkedStandupPolicy(input.routine);
+    if (linkedStandupPolicy) {
+      return dispatchStandupRoutineRun({ ...input, payload: triggerPayload }, linkedStandupPolicy);
+    }
+
+    const description = interpolateRoutineTemplate(input.routine.description, resolvedVariables);
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
