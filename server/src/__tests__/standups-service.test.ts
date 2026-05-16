@@ -342,6 +342,59 @@ describeEmbeddedPostgres("standupService", () => {
     expect(replay.status).toBe("queued");
   });
 
+  it("keeps canonical action creation atomic under concurrent retries", async () => {
+    const seed = await seedCompany();
+    const inspection = await fireSeededStandup(seed);
+    const actionInput = {
+      sessionId: inspection.session!.id,
+      ownerAgentId: seed.croId,
+      sourceBlockerKey: "generator_nonproductive",
+      canonicalKey: "car-daily:2026-05-16:generator_nonproductive:CRO",
+      dueAt: "2026-05-16T17:00:00.000Z",
+      proofTarget: "CAR action issue contains the generator probe output.",
+      timingState: "due_before_next_standup",
+      serviceRunId: seed.serviceRunId,
+    };
+
+    const [first, second] = await Promise.all([
+      svc.createAction(actionInput),
+      svc.createAction(actionInput),
+    ]);
+
+    expect(first.id).toBe(second.id);
+    const actions = await db.select().from(standupActions).where(eq(standupActions.sessionId, inspection.session!.id));
+    const actionOutboxJobs = await db.select().from(standupOutboxJobs).where(eq(standupOutboxJobs.sessionId, inspection.session!.id));
+    const actionIssues = (await db.select().from(issues)).filter((issue) => issue.originKind === "standup_action");
+    expect(actions).toHaveLength(1);
+    expect(actionIssues).toHaveLength(1);
+    expect(actionOutboxJobs.filter((job) => job.jobType === "action_wakeup")).toHaveLength(1);
+  });
+
+  it("keeps canonical escalations atomic under concurrent SLA retries", async () => {
+    const seed = await seedCompany();
+    const inspection = await fireSeededStandup(seed);
+    const input = {
+      sessionId: inspection.session!.id,
+      now: "2026-05-16T16:00:00.000Z",
+      serviceRunId: seed.serviceRunId,
+    };
+
+    await Promise.all([
+      svc.evaluateSla(input),
+      svc.evaluateSla(input),
+    ]);
+
+    const afterSla = await svc.inspect({ sessionId: inspection.session!.id });
+    const escalationIssues = (await db.select().from(issues)).filter((issue) => issue.originKind === "standup_escalation");
+    const escalationOutboxJobs = afterSla.outboxJobs.filter((job) => job.jobType === "escalation_wakeup");
+    expect(afterSla.escalations).toHaveLength(2);
+    expect(new Set(afterSla.escalations.map((escalation) => escalation.canonicalKey)).size).toBe(2);
+    expect(escalationIssues).toHaveLength(2);
+    expect(escalationOutboxJobs).toHaveLength(2);
+    expect(afterSla.participants.every((participant) => participant.responseStatus === "escalated")).toBe(true);
+    expect(afterSla.escalations.every((escalation) => escalation.deliveryProofId?.startsWith("outbox:"))).toBe(true);
+  });
+
   it("does not mark outbox jobs delivered without a real delivery result", async () => {
     const seed = await seedCompany();
     const inspection = await fireSeededStandup(seed);

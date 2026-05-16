@@ -144,13 +144,13 @@ function wallTimeToDate(localDate: string, localTime: string, timeZone: string) 
 }
 
 function isUniqueConstraint(error: unknown, constraint: string) {
+  const err = error as { code?: string; constraint?: string; constraint_name?: string } | null;
+  const constraintName = err?.constraint ?? err?.constraint_name;
   return (
     !!error &&
     typeof error === "object" &&
-    "code" in error &&
-    (error as { code?: string }).code === "23505" &&
-    "constraint" in error &&
-    (error as { constraint?: string }).constraint === constraint
+    err?.code === "23505" &&
+    constraintName === constraint
   );
 }
 
@@ -842,59 +842,76 @@ export function standupService(db: Db) {
       if (!session) throw notFound("Standup session not found");
       await validateServiceRun(db, session.companyId, input.serviceRunId);
       await assertCompanyAgents(db, session.companyId, [input.ownerAgentId]);
-      const existing = await db
+      const now = new Date();
+
+      const selectExistingAction = (dbOrTx: DbOrTx) => dbOrTx
         .select()
         .from(standupActions)
         .where(and(eq(standupActions.companyId, session.companyId), eq(standupActions.canonicalKey, input.canonicalKey)))
-        .then((rows) => rows[0] ?? null);
-      if (existing) return existing;
+        .then((rows: Array<typeof standupActions.$inferSelect>) => rows[0] ?? null);
 
-      const issue = await createIssueInTx(db, session.companyId, {
-        title: `Standup action: ${input.sourceBlockerKey}`,
-        description: actionBody(input),
-        status: "todo",
-        priority: "high",
-        assigneeAgentId: input.ownerAgentId,
-        originKind: "standup_action",
-        originId: session.id,
-        originRunId: input.serviceRunId,
+      const createActionInTransaction = () => db.transaction(async (tx) => {
+        const existing = await selectExistingAction(tx);
+        if (existing) return existing;
+
+        const issue = await createIssueInTx(tx, session.companyId, {
+          title: `Standup action: ${input.sourceBlockerKey}`,
+          description: actionBody(input),
+          status: "todo",
+          priority: "high",
+          assigneeAgentId: input.ownerAgentId,
+          originKind: "standup_action",
+          originId: session.id,
+          originRunId: input.serviceRunId,
+        });
+        const [action] = await tx
+          .insert(standupActions)
+          .values({
+            companyId: session.companyId,
+            sessionId: session.id,
+            ownerAgentId: input.ownerAgentId,
+            issueId: issue.id,
+            serviceRunId: input.serviceRunId,
+            canonicalKey: input.canonicalKey,
+            sourceBlockerKey: input.sourceBlockerKey,
+            dueAt: new Date(input.dueAt),
+            proofTarget: input.proofTarget,
+            timingState: input.timingState,
+            status: input.status ?? "open",
+            actionJson: input.actionJson ?? {},
+          })
+          .returning();
+        await tx
+          .insert(standupOutboxJobs)
+          .values({
+            companyId: session.companyId,
+            sessionId: session.id,
+            actionId: action.id,
+            serviceRunId: input.serviceRunId,
+            jobType: "action_wakeup",
+            priority: 20,
+            targetKind: "agent",
+            targetId: input.ownerAgentId,
+            idempotencyKey: `${session.id}:action_wakeup:${input.canonicalKey}`,
+            payload: {
+              issueId: issue.id,
+              dueAt: input.dueAt,
+              proofTarget: input.proofTarget,
+            },
+            nextAttemptAt: now,
+          })
+          .onConflictDoNothing();
+        return action;
       });
-      const now = new Date();
-      const [action] = await db
-        .insert(standupActions)
-        .values({
-          companyId: session.companyId,
-          sessionId: session.id,
-          ownerAgentId: input.ownerAgentId,
-          issueId: issue.id,
-          serviceRunId: input.serviceRunId,
-          canonicalKey: input.canonicalKey,
-          sourceBlockerKey: input.sourceBlockerKey,
-          dueAt: new Date(input.dueAt),
-          proofTarget: input.proofTarget,
-          timingState: input.timingState,
-          status: input.status ?? "open",
-          actionJson: input.actionJson ?? {},
-        })
-        .returning();
-      await db.insert(standupOutboxJobs).values({
-        companyId: session.companyId,
-        sessionId: session.id,
-        actionId: action.id,
-        serviceRunId: input.serviceRunId,
-        jobType: "action_wakeup",
-        priority: 20,
-        targetKind: "agent",
-        targetId: input.ownerAgentId,
-        idempotencyKey: `${session.id}:action_wakeup:${input.canonicalKey}`,
-        payload: {
-          issueId: issue.id,
-          dueAt: input.dueAt,
-          proofTarget: input.proofTarget,
-        },
-        nextAttemptAt: now,
-      });
-      return action;
+
+      try {
+        return await createActionInTransaction();
+      } catch (error) {
+        if (!isUniqueConstraint(error, "standup_actions_company_canonical_key_uq")) throw error;
+        const existing = await selectExistingAction(db);
+        if (!existing) throw error;
+        return existing;
+      }
     },
 
     evaluateSla: async (input: EvaluateStandupSla) => {
@@ -928,99 +945,121 @@ export function standupService(db: Db) {
         const actingOwnerAgentId = resolveActingOwnerAgentId(policy, participant);
         await assertCompanyAgents(db, session.companyId, [actingOwnerAgentId]);
         const canonicalKey = `${session.id}:missing_response:${participant.agentId}`;
-        const existing = await db
+        const reason = participant.responseStatus === "rejected" ? "invalid_or_generic_response" : "missing_response";
+        const closureCondition = "Participant submits a valid standup response or the acting owner records explicit recovery action.";
+
+        const selectExistingEscalation = (dbOrTx: DbOrTx) => dbOrTx
           .select()
           .from(standupEscalations)
           .where(and(eq(standupEscalations.companyId, session.companyId), eq(standupEscalations.canonicalKey, canonicalKey)))
-          .then((rows) => rows[0] ?? null);
-        const reason = participant.responseStatus === "rejected" ? "invalid_or_generic_response" : "missing_response";
-        const closureCondition = "Participant submits a valid standup response or the acting owner records explicit recovery action.";
-        const escalationIssue = existing?.escalationIssueId
-          ? null
-          : await createIssueInTx(db, session.companyId, {
-            title: `Standup escalation: ${participant.agentId}`,
-            description: escalationBody({ policy, participant, reason, deadlineAt: participant.escalationDueAt, closureCondition }),
-            status: "todo",
-            priority: "high",
-            assigneeAgentId: actingOwnerAgentId,
-            originKind: "standup_escalation",
-            originId: session.id,
-            originRunId: input.serviceRunId,
-          });
-        const [escalation] = existing
-          ? await db
-            .update(standupEscalations)
+          .then((rows: Array<typeof standupEscalations.$inferSelect>) => rows[0] ?? null);
+
+        const writeEscalation = async (
+          tx: DbOrTx,
+          existing: typeof standupEscalations.$inferSelect | null,
+        ) => {
+          const escalationIssue = existing?.escalationIssueId
+            ? null
+            : await createIssueInTx(tx, session.companyId, {
+              title: `Standup escalation: ${participant.agentId}`,
+              description: escalationBody({ policy, participant, reason, deadlineAt: participant.escalationDueAt, closureCondition }),
+              status: "todo",
+              priority: "high",
+              assigneeAgentId: actingOwnerAgentId,
+              originKind: "standup_escalation",
+              originId: session.id,
+              originRunId: input.serviceRunId,
+            });
+          const [escalation] = existing
+            ? await tx
+              .update(standupEscalations)
+              .set({
+                reason,
+                actingOwnerAgentId,
+                deadlineAt: participant.escalationDueAt,
+                closureCondition,
+                serviceRunId: input.serviceRunId,
+                updatedAt: now,
+              })
+              .where(eq(standupEscalations.id, existing.id))
+              .returning()
+            : await tx
+              .insert(standupEscalations)
+              .values({
+                companyId: session.companyId,
+                sessionId: session.id,
+                participantId: participant.id,
+                agentId: participant.agentId,
+                actingOwnerAgentId,
+                escalationIssueId: escalationIssue?.id ?? null,
+                serviceRunId: input.serviceRunId,
+                canonicalKey,
+                reason,
+                deadlineAt: participant.escalationDueAt,
+                closureCondition,
+                status: "acting_owner_assigned",
+              })
+              .returning();
+
+          await tx
+            .update(standupParticipants)
             .set({
-              reason,
-              actingOwnerAgentId,
-              deadlineAt: participant.escalationDueAt,
-              closureCondition,
-              serviceRunId: input.serviceRunId,
+              responseStatus: "escalated",
+              escalatedAt: now,
+              escalationId: escalation.id,
               updatedAt: now,
             })
-            .where(eq(standupEscalations.id, existing.id))
-            .returning()
-          : await db
-            .insert(standupEscalations)
+            .where(eq(standupParticipants.id, participant.id));
+          const [queuedEscalationJob] = await tx
+            .insert(standupOutboxJobs)
             .values({
               companyId: session.companyId,
               sessionId: session.id,
               participantId: participant.id,
-              agentId: participant.agentId,
-              actingOwnerAgentId,
-              escalationIssueId: escalationIssue?.id ?? null,
+              escalationId: escalation.id,
               serviceRunId: input.serviceRunId,
-              canonicalKey,
-              reason,
-              deadlineAt: participant.escalationDueAt,
-              closureCondition,
-              status: "acting_owner_assigned",
+              jobType: "escalation_wakeup",
+              priority: 5,
+              targetKind: "agent",
+              targetId: actingOwnerAgentId,
+              idempotencyKey: `${session.id}:escalation_wakeup:${participant.agentId}`,
+              payload: {
+                escalationIssueId: escalation.escalationIssueId ?? escalationIssue?.id ?? null,
+                reason,
+                deadlineAt: participant.escalationDueAt.toISOString(),
+              },
             })
+            .onConflictDoNothing()
             .returning();
-
-        await db
-          .update(standupParticipants)
-          .set({
-            responseStatus: "escalated",
-            escalatedAt: now,
-            escalationId: escalation.id,
-            updatedAt: now,
-          })
-          .where(eq(standupParticipants.id, participant.id));
-        const [queuedEscalationJob] = await db
-          .insert(standupOutboxJobs)
-          .values({
-            companyId: session.companyId,
-            sessionId: session.id,
-            participantId: participant.id,
-            escalationId: escalation.id,
-            serviceRunId: input.serviceRunId,
-            jobType: "escalation_wakeup",
-            priority: 5,
-            targetKind: "agent",
-            targetId: actingOwnerAgentId,
-            idempotencyKey: `${session.id}:escalation_wakeup:${participant.agentId}`,
-            payload: {
-              escalationIssueId: escalation.escalationIssueId ?? escalationIssue?.id ?? null,
-              reason,
-              deadlineAt: participant.escalationDueAt.toISOString(),
-            },
-          })
-          .onConflictDoNothing()
-          .returning();
-        const escalationJob = queuedEscalationJob ?? await db
-          .select()
-          .from(standupOutboxJobs)
-          .where(and(eq(standupOutboxJobs.companyId, session.companyId), eq(standupOutboxJobs.idempotencyKey, `${session.id}:escalation_wakeup:${participant.agentId}`)))
-          .then((rows) => rows[0] ?? null);
-        if (escalationJob) {
-          await db
+          const escalationJob = queuedEscalationJob ?? await tx
+            .select()
+            .from(standupOutboxJobs)
+            .where(and(eq(standupOutboxJobs.companyId, session.companyId), eq(standupOutboxJobs.idempotencyKey, `${session.id}:escalation_wakeup:${participant.agentId}`)))
+            .then((rows: Array<typeof standupOutboxJobs.$inferSelect>) => rows[0] ?? null);
+          if (!escalationJob) return escalation;
+          const [updatedEscalation] = await tx
             .update(standupEscalations)
             .set({
               deliveryProofId: `outbox:${escalationJob.id}:queued`,
               updatedAt: now,
             })
-            .where(eq(standupEscalations.id, escalation.id));
+            .where(eq(standupEscalations.id, escalation.id))
+            .returning();
+          return updatedEscalation;
+        };
+
+        try {
+          await db.transaction(async (tx) => {
+            const existing = await selectExistingEscalation(tx);
+            await writeEscalation(tx, existing);
+          });
+        } catch (error) {
+          if (!isUniqueConstraint(error, "standup_escalations_company_canonical_key_uq")) throw error;
+          await db.transaction(async (tx) => {
+            const existing = await selectExistingEscalation(tx);
+            if (!existing) throw error;
+            await writeEscalation(tx, existing);
+          });
         }
       }
 
