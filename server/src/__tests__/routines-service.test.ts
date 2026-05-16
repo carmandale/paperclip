@@ -330,18 +330,26 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.originKind, "routine_execution"));
     expect(routineIssues).toHaveLength(0);
 
-    const inspection = await standups.inspect({
+    let inspection = await standups.inspect({
       companyId: fixture.companyId,
       policyKey: "car-daily",
       localDate: "2026-05-16",
     });
-    expect(inspection.standup_forced).toBe(true);
+    expect(inspection.standup_forced).toBe(false);
+    expect(inspection.missing_evidence).toContain("directive_delivery");
     expect(inspection.session?.routineId).toBe(fixture.routine.id);
     expect(inspection.session?.routineRunId).toBe(run.id);
     expect(inspection.session?.standupIssueId).toBe(run.linkedIssueId);
     expect(inspection.session?.triggerSource).toBe("manual");
     expect(inspection.participants).toHaveLength(1);
     expect(inspection.outboxJobs.map((job) => job.jobType)).toEqual(["directive_wakeup"]);
+
+    await standups.processOutbox({
+      limit: 10,
+      deliver: async (job) => ({ ok: true, proofId: `delivered:${job.id}` }),
+    });
+    inspection = await standups.inspect({ sessionId: inspection.session!.id });
+    expect(inspection.standup_forced).toBe(true);
   });
 
   it("fires linked standup routines from missed scheduled ticks", async () => {

@@ -172,6 +172,40 @@ function responseHasGenericAnswer(response: StandupResponseBody, denylist: strin
   return Object.values(response).some((value) => stringValueIncludesDenylist(value, denylist));
 }
 
+const ACCEPTABLE_ACTION_TIMING_STATES = new Set([
+  "by_12_local",
+  "by_12_america_chicago",
+  "before_noon_local",
+  "due_before_next_standup",
+  "before_next_standup",
+]);
+
+function actionHasTimelyProof(action: typeof standupActions.$inferSelect) {
+  return ACCEPTABLE_ACTION_TIMING_STATES.has(action.timingState.trim().toLowerCase());
+}
+
+function participantHasDirectiveDelivery(
+  participant: typeof standupParticipants.$inferSelect,
+  deliveredDirectiveParticipantIds: Set<string>,
+) {
+  return (
+    !!participant.directiveIssueId &&
+    (participant.deliveryStatus === "delivered" || deliveredDirectiveParticipantIds.has(participant.id))
+  );
+}
+
+function actionHasDeliveryReceipt(
+  action: typeof standupActions.$inferSelect,
+  outboxJobs: Array<typeof standupOutboxJobs.$inferSelect>,
+) {
+  return outboxJobs.some((job) =>
+    job.actionId === action.id &&
+    job.jobType === "action_wakeup" &&
+    job.status === "succeeded" &&
+    !!job.deliveredAt,
+  );
+}
+
 function responseSchemaRejectedReason(response: unknown, responseSchema: Record<string, unknown>) {
   const parsed = standupResponseBodySchema.safeParse(response);
   if (!parsed.success) return "response_schema_invalid";
@@ -477,13 +511,51 @@ export function standupService(db: Db) {
     if (policy && participants.length < policy.participantAgentIds.length) missingEvidence.push("all_participants");
     if (participants.some((participant) => !participant.directiveIssueId)) missingEvidence.push("directive_issue");
     if (outboxJobs.length === 0) missingEvidence.push("outbox");
+    const deliveredDirectiveParticipantIds = new Set(
+      outboxJobs
+        .filter((job) =>
+          job.jobType === "directive_wakeup" &&
+          job.status === "succeeded" &&
+          !!job.deliveredAt &&
+          !!job.participantId,
+        )
+        .map((job) => job.participantId!),
+    );
+    const allDirectivesDelivered =
+      participants.length > 0 &&
+      participants.every((participant) => participantHasDirectiveDelivery(participant, deliveredDirectiveParticipantIds));
+    if (participants.length > 0 && !allDirectivesDelivered) missingEvidence.push("directive_delivery");
+    if (actions.length === 0) {
+      missingEvidence.push("action");
+    } else if (actions.some((action) => !actionHasTimelyProof(action))) {
+      missingEvidence.push("action_timing");
+    }
+    if (actions.some((action) => !actionHasDeliveryReceipt(action, outboxJobs))) {
+      missingEvidence.push("action_delivery");
+    }
+    if (escalations.some((escalation) => !escalation.actingOwnerAgentId)) {
+      missingEvidence.push("escalation_acting_owner");
+    }
+    if (escalations.some((escalation) => !escalation.closureCondition?.trim())) {
+      missingEvidence.push("escalation_closure");
+    }
+    if (escalations.some((escalation) => !escalation.deliveryProofId?.trim())) {
+      missingEvidence.push("escalation_delivery");
+    }
 
     const standupForced =
       !!session.standupIssueId &&
       ["forced", "completed"].includes(session.status) &&
       participants.length > 0 &&
-      participants.every((participant) => !!participant.directiveIssueId);
-    const actionTaken = actions.some((action) => !!action.issueId && !!action.ownerAgentId && !!action.proofTarget && !!action.dueAt);
+      participants.every((participant) => participantHasDirectiveDelivery(participant, deliveredDirectiveParticipantIds));
+    const actionTaken = actions.some((action) =>
+      !!action.issueId &&
+      !!action.ownerAgentId &&
+      !!action.proofTarget &&
+      !!action.dueAt &&
+      actionHasTimelyProof(action) &&
+      actionHasDeliveryReceipt(action, outboxJobs),
+    );
     const assessment = asRecord(session.assessmentSnapshot);
     const rawStatus =
       typeof assessment.carStatus === "string"
@@ -1160,6 +1232,17 @@ export function standupService(db: Db) {
       if (!job) throw notFound("Standup outbox job not found");
       await validateServiceRun(db, job.companyId, input.serviceRunId);
       if (input.jobType && job.jobType !== input.jobType) throw unprocessable("Outbox job type mismatch");
+      const existingReplay = await db
+        .select()
+        .from(standupOutboxJobs)
+        .where(and(eq(standupOutboxJobs.companyId, job.companyId), eq(standupOutboxJobs.idempotencyKey, input.idempotencyKey)))
+        .then((rows) => rows[0] ?? null);
+      if (existingReplay) {
+        if (existingReplay.replayOfJobId !== job.id) {
+          throw conflict("Replay idempotency key belongs to another outbox job");
+        }
+        return existingReplay;
+      }
       const [replay] = await db
         .insert(standupOutboxJobs)
         .values({

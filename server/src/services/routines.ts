@@ -847,7 +847,12 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
         serviceRunId,
       });
       const linkedIssueId = inspection.session?.standupIssueId ?? null;
-      const status = inspection.standup_forced && linkedIssueId ? "issue_created" : "failed";
+      const sessionFired =
+        !!linkedIssueId &&
+        ["forced", "completed"].includes(inspection.session?.status ?? "") &&
+        inspection.participants.length > 0 &&
+        inspection.participants.every((participant) => !!participant.directiveIssueId);
+      const status = sessionFired ? "issue_created" : "failed";
       const failureReason = status === "failed"
         ? inspection.session?.failureReason ?? `standup_fire_missing:${inspection.missing_evidence.join(",") || "standup_forced"}`
         : null;

@@ -186,9 +186,10 @@ describeEmbeddedPostgres("standupService", () => {
 
     const inspection = await fireSeededStandup(seed);
 
-    expect(inspection.standup_forced).toBe(true);
+    expect(inspection.standup_forced).toBe(false);
     expect(inspection.car_still_non_green).toBe(true);
     expect(inspection.action_taken).toBe(false);
+    expect(inspection.missing_evidence).toContain("directive_delivery");
     expect(inspection.session?.standupIssueId).toBeTruthy();
     expect(inspection.participants).toHaveLength(2);
     expect(inspection.participants.every((participant) => participant.directiveIssueId)).toBe(true);
@@ -198,6 +199,33 @@ describeEmbeddedPostgres("standupService", () => {
       .select()
       .from(issues)
       .where(eq(issues.originKind, "standup_directive"));
+    expect(directiveIssues).toHaveLength(2);
+
+    await svc.processOutbox({
+      limit: 10,
+      deliver: async (job) => ({ ok: true, proofId: `delivered:${job.id}` }),
+    });
+    const afterDelivery = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterDelivery.standup_forced).toBe(true);
+    expect(afterDelivery.missing_evidence).not.toContain("directive_delivery");
+  });
+
+  it("coalesces concurrent fires into one session with one participant/outbox set", async () => {
+    const seed = await seedCompany();
+
+    const [first, second] = await Promise.all([
+      fireSeededStandup(seed),
+      fireSeededStandup(seed),
+    ]);
+
+    expect(first.session?.id).toBe(second.session?.id);
+    const sessions = await db.select().from(standupSessions);
+    const participants = await db.select().from(standupParticipants);
+    const outboxJobs = await db.select().from(standupOutboxJobs);
+    const directiveIssues = await db.select().from(issues).where(eq(issues.originKind, "standup_directive"));
+    expect(sessions).toHaveLength(1);
+    expect(participants).toHaveLength(2);
+    expect(outboxJobs.filter((job) => job.jobType === "directive_wakeup")).toHaveLength(2);
     expect(directiveIssues).toHaveLength(2);
   });
 
@@ -274,6 +302,25 @@ describeEmbeddedPostgres("standupService", () => {
     expect(schemaRejected.valid).toBe(false);
     expect(schemaRejected.rejectedReason).toBe("response_schema_invalid");
 
+    await expect(
+      svc.submitResponse({
+        sessionId: inspection.session!.id,
+        participantId: ceoParticipant!.id,
+        actorRunId: randomUUID(),
+        response: validResponse("CEO"),
+      }, { agentId: seed.ceoId }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    const otherCompany = await seedCompany();
+    await expect(
+      svc.submitResponse({
+        sessionId: inspection.session!.id,
+        participantId: ceoParticipant!.id,
+        actorRunId: otherCompany.serviceRunId,
+        response: validResponse("CEO"),
+      }, { agentId: seed.ceoId }),
+    ).rejects.toMatchObject({ status: 403 });
+
     const afterSla = await svc.evaluateSla({
       sessionId: inspection.session!.id,
       now: "2026-05-16T16:00:00.000Z",
@@ -320,7 +367,8 @@ describeEmbeddedPostgres("standupService", () => {
     expect(duplicate.id).toBe(action.id);
 
     let afterAction = await svc.inspect({ sessionId: inspection.session!.id });
-    expect(afterAction.action_taken).toBe(true);
+    expect(afterAction.action_taken).toBe(false);
+    expect(afterAction.missing_evidence).toContain("action_delivery");
     expect(afterAction.actions).toHaveLength(1);
 
     const processed = await svc.processOutbox({
@@ -331,6 +379,7 @@ describeEmbeddedPostgres("standupService", () => {
     expect(processed.every((job) => job.status === "succeeded")).toBe(true);
 
     afterAction = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterAction.action_taken).toBe(true);
     expect(afterAction.participants.every((participant) => participant.deliveryStatus === "delivered")).toBe(true);
 
     const replay = await svc.replayOutboxJob({
@@ -340,6 +389,47 @@ describeEmbeddedPostgres("standupService", () => {
     });
     expect(replay.replayOfJobId).toBe(processed[0].id);
     expect(replay.status).toBe("queued");
+
+    const replayAgain = await svc.replayOutboxJob({
+      jobId: processed[0].id,
+      idempotencyKey: `replay:${processed[0].id}`,
+      serviceRunId: seed.serviceRunId,
+    });
+    expect(replayAgain.id).toBe(replay.id);
+    const replayJobs = (await db.select().from(standupOutboxJobs)).filter((job) => job.replayOfJobId === processed[0].id);
+    expect(replayJobs).toHaveLength(1);
+  });
+
+  it("processes deadline-priority outbox jobs before ordinary directive and action wakeups", async () => {
+    const seed = await seedCompany();
+    const inspection = await fireSeededStandup(seed);
+    await svc.createAction({
+      sessionId: inspection.session!.id,
+      ownerAgentId: seed.croId,
+      sourceBlockerKey: "generator_nonproductive",
+      canonicalKey: "car-daily:2026-05-16:generator_nonproductive:CRO",
+      dueAt: "2026-05-16T17:00:00.000Z",
+      proofTarget: "CAR action issue contains the generator probe output.",
+      timingState: "due_before_next_standup",
+      serviceRunId: seed.serviceRunId,
+    });
+    await svc.evaluateSla({
+      sessionId: inspection.session!.id,
+      now: "2026-05-16T16:00:00.000Z",
+      serviceRunId: seed.serviceRunId,
+    });
+
+    const seenJobTypes: string[] = [];
+    const processed = await svc.processOutbox({
+      limit: 1,
+      deliver: async (job) => {
+        seenJobTypes.push(job.jobType);
+        return { ok: true, proofId: `delivered:${job.id}` };
+      },
+    });
+
+    expect(processed).toHaveLength(1);
+    expect(seenJobTypes).toEqual(["escalation_wakeup"]);
   });
 
   it("keeps canonical action creation atomic under concurrent retries", async () => {
@@ -428,6 +518,76 @@ describeEmbeddedPostgres("standupService", () => {
     afterFailure = await svc.inspect({ sessionId: inspection.session!.id });
     expect(afterFailure.deadLetters).toHaveLength(1);
     expect(afterFailure.partial_failure).toBe(true);
+  });
+
+  it("rejects inspect false positives for routine shells, generic answers, late actions, and missing delivery", async () => {
+    const seed = await seedCompany();
+    const missingSession = await svc.inspect({
+      companyId: seed.companyId,
+      policyKey: "car-daily",
+      localDate: "2026-05-16",
+    });
+    expect(missingSession.standup_forced).toBe(false);
+    expect(missingSession.action_taken).toBe(false);
+    expect(missingSession.missing_evidence).toContain("session");
+
+    const inspection = await fireSeededStandup(seed);
+    expect(inspection.standup_forced).toBe(false);
+    expect(inspection.missing_evidence).toContain("directive_delivery");
+
+    await svc.processOutbox({
+      limit: 10,
+      deliver: async (job) => ({ ok: true, proofId: `delivered:${job.id}` }),
+    });
+    let afterDelivery = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterDelivery.standup_forced).toBe(true);
+    expect(afterDelivery.action_taken).toBe(false);
+    expect(afterDelivery.missing_evidence).toContain("action");
+
+    const ceoParticipant = afterDelivery.participants.find((participant) => participant.agentId === seed.ceoId)!;
+    await svc.submitResponse({
+      sessionId: inspection.session!.id,
+      participantId: ceoParticipant.id,
+      actorRunId: seed.ceoRunId,
+      response: {
+        ...validResponse("CEO"),
+        whatHappened: "Awaiting directives.",
+      },
+    }, { agentId: seed.ceoId });
+    afterDelivery = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterDelivery.action_taken).toBe(false);
+    expect(afterDelivery.responses.some((response) => !response.valid && response.rejectedReason === "generic_answer_denylist")).toBe(true);
+
+    await svc.createAction({
+      sessionId: inspection.session!.id,
+      ownerAgentId: seed.croId,
+      sourceBlockerKey: "generator_nonproductive",
+      canonicalKey: "car-daily:2026-05-16:generator_nonproductive:late",
+      dueAt: "2026-05-18T17:00:00.000Z",
+      proofTarget: "CAR action issue contains the generator probe output.",
+      timingState: "late_after_next_standup",
+      serviceRunId: seed.serviceRunId,
+    });
+    await svc.processOutbox({
+      limit: 10,
+      deliver: async (job) => ({ ok: true, proofId: `delivered:${job.id}` }),
+    });
+    const afterLateAction = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterLateAction.action_taken).toBe(false);
+    expect(afterLateAction.missing_evidence).toContain("action_timing");
+
+    await svc.evaluateSla({
+      sessionId: inspection.session!.id,
+      now: "2026-05-16T16:00:00.000Z",
+      serviceRunId: seed.serviceRunId,
+    });
+    await db
+      .update(standupEscalations)
+      .set({ closureCondition: "", deliveryProofId: null })
+      .where(eq(standupEscalations.sessionId, inspection.session!.id));
+    const afterBrokenEscalation = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterBrokenEscalation.missing_evidence).toContain("escalation_closure");
+    expect(afterBrokenEscalation.missing_evidence).toContain("escalation_delivery");
   });
 
   it("keeps fire-time failures inspectable instead of disappearing", async () => {
