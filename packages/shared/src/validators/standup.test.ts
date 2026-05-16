@@ -5,6 +5,7 @@ import {
   evaluateStandupSlaSchema,
   inspectStandupSchema,
   manualStandupFireSchema,
+  processStandupOutboxSchema,
   replayStandupOutboxJobSchema,
   submitStandupResponseSchema,
   upsertStandupPolicySchema,
@@ -153,6 +154,25 @@ describe("standup validators", () => {
       jobId: uuidA,
       idempotencyKey: "",
       serviceRunId: uuidB,
+    }).success).toBe(false);
+  });
+
+  it("validates outbox processing scope and service run proof", () => {
+    const parsed = processStandupOutboxSchema.safeParse({
+      companyId: uuidA,
+      sessionId: uuidB,
+      serviceRunId: uuidC,
+      limit: 10,
+      now: "2026-05-16T15:30:00.000Z",
+    });
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.data?.limit).toBe(10);
+
+    expect(processStandupOutboxSchema.safeParse({
+      companyId: uuidA,
+      serviceRunId: uuidC,
+      limit: 0,
     }).success).toBe(false);
   });
 

@@ -41,6 +41,14 @@ const manualFirePayload = {
   serviceRunId,
 };
 
+const processOutboxPayload = {
+  companyId,
+  sessionId,
+  serviceRunId,
+  limit: 5,
+  now: "2026-05-16T15:30:00.000Z",
+};
+
 const responsePayload = {
   sessionId,
   participantId,
@@ -153,6 +161,7 @@ const mockStandupService = vi.hoisted(() => ({
   inspect: vi.fn(),
   getOutboxJob: vi.fn(),
   replayOutboxJob: vi.fn(),
+  processOutbox: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -190,6 +199,9 @@ describe("standup routes", () => {
     mockStandupService.inspect.mockResolvedValue(inspection);
     mockStandupService.getOutboxJob.mockResolvedValue(outboxJob);
     mockStandupService.replayOutboxJob.mockResolvedValue(replayJob);
+    mockStandupService.processOutbox.mockResolvedValue([
+      { ...outboxJob, status: "succeeded", deliveredAt: new Date("2026-05-16T15:30:00.000Z") },
+    ]);
   });
 
   it("allows server-local proof mode to upsert a policy with service-run provenance", async () => {
@@ -483,5 +495,51 @@ describe("standup routes", () => {
     expect(res.status).toBe(403);
     expect(mockStandupService.getOutboxJob).toHaveBeenCalledWith(jobId);
     expect(mockStandupService.replayOutboxJob).not.toHaveBeenCalled();
+  });
+
+  it("processes standup outbox jobs for an authorized operator and redacts payload", async () => {
+    mockAccessService.canUser.mockResolvedValue(true);
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .post("/api/standups/outbox/process")
+      .send(processOutboxPayload);
+
+    expect(res.status).toBe(200);
+    expect(mockStandupService.inspect).toHaveBeenCalledWith({ sessionId });
+    expect(mockStandupService.processOutbox).toHaveBeenCalledWith(expect.objectContaining({
+      companyId,
+      sessionId,
+      serviceRunId,
+      limit: 5,
+      now: expect.any(Date),
+      deliver: expect.any(Function),
+    }));
+    expect(res.body.processedCount).toBe(1);
+    expect(res.body.processed[0].payload).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain("do not leak");
+  });
+
+  it("denies outbox processing before delivery when board permission is missing", async () => {
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .post("/api/standups/outbox/process")
+      .send(processOutboxPayload);
+
+    expect(res.status).toBe(403);
+    expect(mockStandupService.processOutbox).not.toHaveBeenCalled();
   });
 });

@@ -21,6 +21,7 @@ import type {
   EvaluateStandupSla,
   InspectStandup,
   ManualStandupFire,
+  ProcessStandupOutbox,
   ReplayStandupOutboxJob,
   StandupResponseBody,
   SubmitStandupResponse,
@@ -44,7 +45,7 @@ type FireStandupInput = ManualStandupFire & {
   triggerSource?: "manual" | "schedule" | "api" | "webhook";
 };
 
-type OutboxProcessInput = {
+type OutboxProcessInput = Partial<Pick<ProcessStandupOutbox, "companyId" | "sessionId" | "serviceRunId">> & {
   now?: Date;
   limit?: number;
   deliver?: (job: typeof standupOutboxJobs.$inferSelect) => Promise<OutboxDeliveryResult> | OutboxDeliveryResult;
@@ -1148,16 +1149,20 @@ export function standupService(db: Db) {
     processOutbox: async (input: OutboxProcessInput = {}) => {
       const now = input.now ?? new Date();
       const limit = Math.max(1, Math.min(input.limit ?? 25, 100));
+      if (input.companyId && input.serviceRunId) {
+        await validateServiceRun(db, input.companyId, input.serviceRunId);
+      }
+      const predicates = [
+        inArray(standupOutboxJobs.status, ["queued", "failed"]),
+        lte(standupOutboxJobs.nextAttemptAt, now),
+        isNull(standupOutboxJobs.deadLetteredAt),
+      ];
+      if (input.companyId) predicates.push(eq(standupOutboxJobs.companyId, input.companyId));
+      if (input.sessionId) predicates.push(eq(standupOutboxJobs.sessionId, input.sessionId));
       const jobs = await db
         .select()
         .from(standupOutboxJobs)
-        .where(
-          and(
-            inArray(standupOutboxJobs.status, ["queued", "failed"]),
-            lte(standupOutboxJobs.nextAttemptAt, now),
-            isNull(standupOutboxJobs.deadLetteredAt),
-          ),
-        )
+        .where(and(...predicates))
         .orderBy(asc(standupOutboxJobs.priority), asc(standupOutboxJobs.createdAt), asc(standupOutboxJobs.id))
         .limit(limit);
       const processed: Array<typeof standupOutboxJobs.$inferSelect> = [];

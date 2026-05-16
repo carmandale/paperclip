@@ -111,6 +111,16 @@ export const replayStandupOutboxJobSchema = z.object({
 
 export type ReplayStandupOutboxJob = z.infer<typeof replayStandupOutboxJobSchema>;
 
+export const processStandupOutboxSchema = z.object({
+  companyId: z.string().uuid(),
+  sessionId: z.string().uuid().optional(),
+  limit: z.number().int().min(1).max(100).default(25),
+  now: z.string().datetime().optional(),
+  serviceRunId: serviceRunIdSchema,
+});
+
+export type ProcessStandupOutbox = z.infer<typeof processStandupOutboxSchema>;
+
 export const disableStandupPolicySchema = z.object({
   policyKey: z.string().trim().min(1).max(120),
   standupType: z.string().trim().min(1).max(80).default("daily"),

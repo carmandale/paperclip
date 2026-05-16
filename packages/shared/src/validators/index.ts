@@ -234,6 +234,7 @@ export {
   createStandupActionSchema,
   inspectStandupSchema,
   replayStandupOutboxJobSchema,
+  processStandupOutboxSchema,
   disableStandupPolicySchema,
   type StandupResponseBody,
   type UpsertStandupPolicy,
@@ -243,6 +244,7 @@ export {
   type CreateStandupAction,
   type InspectStandup,
   type ReplayStandupOutboxJob,
+  type ProcessStandupOutbox,
   type DisableStandupPolicy,
 } from "./standup.js";
 

@@ -488,7 +488,8 @@ describeEmbeddedPostgres("standupService", () => {
   it("does not mark outbox jobs delivered without a real delivery result", async () => {
     const seed = await seedCompany();
     const inspection = await fireSeededStandup(seed);
-    const now = new Date("2026-05-16T16:30:00.000Z");
+    const now = new Date(Date.now() + 60_000);
+    const retryAt = new Date(now.getTime() + 60_000);
 
     const failed = await svc.processOutbox({ limit: 1, now });
 
@@ -503,13 +504,13 @@ describeEmbeddedPostgres("standupService", () => {
       .update(standupOutboxJobs)
       .set({
         maxAttempts: 2,
-        nextAttemptAt: new Date("2026-05-16T16:31:00.000Z"),
+        nextAttemptAt: retryAt,
       })
       .where(eq(standupOutboxJobs.id, failed[0].id));
 
     const deadLettered = await svc.processOutbox({
       limit: 1,
-      now: new Date("2026-05-16T16:31:00.000Z"),
+      now: retryAt,
       deliver: async () => ({ ok: false, error: "agent wake failed" }),
     });
 
