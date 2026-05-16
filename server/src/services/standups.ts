@@ -26,6 +26,7 @@ import type {
   SubmitStandupResponse,
   UpsertStandupPolicy,
 } from "@paperclipai/shared";
+import { standupResponseBodySchema } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { validateCron } from "./cron.js";
 
@@ -46,6 +47,14 @@ type FireStandupInput = ManualStandupFire & {
 type OutboxProcessInput = {
   now?: Date;
   limit?: number;
+  deliver?: (job: typeof standupOutboxJobs.$inferSelect) => Promise<OutboxDeliveryResult> | OutboxDeliveryResult;
+};
+
+type OutboxDeliveryResult = {
+  ok: boolean;
+  proofId?: string | null;
+  error?: string | null;
+  retryAt?: Date | null;
 };
 
 type IssueInsert = {
@@ -161,6 +170,41 @@ function stringValueIncludesDenylist(value: unknown, denylist: string[]) {
 function responseHasGenericAnswer(response: StandupResponseBody, denylist: string[]) {
   if (denylist.length === 0) return false;
   return Object.values(response).some((value) => stringValueIncludesDenylist(value, denylist));
+}
+
+function responseSchemaRejectedReason(response: unknown, responseSchema: Record<string, unknown>) {
+  const parsed = standupResponseBodySchema.safeParse(response);
+  if (!parsed.success) return "response_schema_invalid";
+
+  const required = Array.isArray(responseSchema.required)
+    ? responseSchema.required.filter((field): field is string => typeof field === "string" && field.trim().length > 0)
+    : [];
+  const responseRecord = parsed.data as Record<string, unknown>;
+  const missing = required.filter((field) => {
+    const value = responseRecord[field];
+    return typeof value !== "string" || value.trim().length === 0;
+  });
+  if (missing.length > 0) return `response_schema_missing:${missing.join(",")}`;
+  return null;
+}
+
+function responseJsonForStorage(response: unknown) {
+  const record = asRecord(response);
+  if (Object.keys(record).length > 0) return record;
+  return { invalidResponse: response == null ? null : String(response) };
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function deliveryProofId(job: typeof standupOutboxJobs.$inferSelect, attempts: number, proofId?: string | null) {
+  return proofId?.trim() || `standup_outbox_jobs:${job.id}:attempt:${attempts}`;
+}
+
+function nextRetryAt(now: Date, attempts: number) {
+  const delayMs = Math.min(15 * 60_000, 30_000 * 2 ** Math.max(0, attempts - 1));
+  return new Date(now.getTime() + delayMs);
 }
 
 function resolveActingOwnerAgentId(
@@ -666,7 +710,6 @@ export function standupService(db: Db) {
           .where(eq(standupSessions.id, session.id));
         return session.id;
       }).catch(async (error) => {
-        if (!isUniqueConstraint(error, "standup_sessions_company_date_type_uq")) throw error;
         const existing = await db
           .select({ id: standupSessions.id })
           .from(standupSessions)
@@ -678,8 +721,37 @@ export function standupService(db: Db) {
             ),
           )
           .then((rows) => rows[0] ?? null);
-        if (!existing) throw error;
-        return existing.id;
+        if (existing) return existing.id;
+        if (isUniqueConstraint(error, "standup_sessions_company_date_type_uq")) throw error;
+
+        const [failed] = await db
+          .insert(standupSessions)
+          .values({
+            companyId,
+            policyId: policy.id,
+            routineId: input.routineId ?? policy.linkedRoutineId ?? null,
+            triggerId: input.triggerId ?? null,
+            routineRunId: input.routineRunId ?? null,
+            serviceRunId: input.serviceRunId,
+            standupIssueId: null,
+            localDate,
+            standupType: policy.standupType,
+            policyVersion: policy.version,
+            timezone: policy.timezone,
+            status: "failed",
+            triggerSource: input.triggerSource ?? "manual",
+            idempotencyKey,
+            triggerConditionSnapshot: input.triggerConditionSnapshot,
+            assessmentSnapshot: input.assessmentSnapshot,
+            manualTriggerReceipt: input.manualTriggerReceipt ?? null,
+            partialIssueIds: [],
+            responseDueAt,
+            escalationDueAt,
+            firedAt: now,
+            failureReason: errorMessage(error),
+          })
+          .returning({ id: standupSessions.id });
+        return failed.id;
       });
 
       return inspect({ sessionId });
@@ -709,7 +781,10 @@ export function standupService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!policy) throw notFound("Standup policy not found");
 
-      const generic = responseHasGenericAnswer(input.response, policy.genericAnswerDenylist);
+      const responseSchemaReason = responseSchemaRejectedReason(input.response, policy.responseSchema);
+      const responseJson = responseJsonForStorage(input.response);
+      const generic = !responseSchemaReason && responseHasGenericAnswer(input.response, policy.genericAnswerDenylist);
+      const rejectedReason = responseSchemaReason ?? (generic ? "generic_answer_denylist" : null);
       const now = new Date();
       const existingAccepted = await db
         .select()
@@ -723,16 +798,16 @@ export function standupService(db: Db) {
           participantId: participant.id,
           actorAgentId: actor.agentId,
           actorRunId: input.actorRunId,
-          responseJson: input.response,
-          valid: !generic,
-          rejectedReason: generic ? "generic_answer_denylist" : null,
+          responseJson,
+          valid: !rejectedReason,
+          rejectedReason,
           submittedAt: now,
       };
-      const [response] = existingAccepted && !generic
+      const [response] = existingAccepted && !rejectedReason
         ? await db
           .update(standupResponses)
           .set({
-            responseJson: input.response,
+            responseJson,
             actorRunId: input.actorRunId,
             submittedAt: now,
             updatedAt: now,
@@ -747,7 +822,7 @@ export function standupService(db: Db) {
       await db
         .update(standupParticipants)
         .set({
-          responseStatus: generic ? "rejected" : "accepted",
+          responseStatus: rejectedReason ? "rejected" : "accepted",
           respondedAt: now,
           updatedAt: now,
         })
@@ -910,7 +985,7 @@ export function standupService(db: Db) {
             updatedAt: now,
           })
           .where(eq(standupParticipants.id, participant.id));
-        await db
+        const [queuedEscalationJob] = await db
           .insert(standupOutboxJobs)
           .values({
             companyId: session.companyId,
@@ -929,7 +1004,22 @@ export function standupService(db: Db) {
               deadlineAt: participant.escalationDueAt.toISOString(),
             },
           })
-          .onConflictDoNothing();
+          .onConflictDoNothing()
+          .returning();
+        const escalationJob = queuedEscalationJob ?? await db
+          .select()
+          .from(standupOutboxJobs)
+          .where(and(eq(standupOutboxJobs.companyId, session.companyId), eq(standupOutboxJobs.idempotencyKey, `${session.id}:escalation_wakeup:${participant.agentId}`)))
+          .then((rows) => rows[0] ?? null);
+        if (escalationJob) {
+          await db
+            .update(standupEscalations)
+            .set({
+              deliveryProofId: `outbox:${escalationJob.id}:queued`,
+              updatedAt: now,
+            })
+            .where(eq(standupEscalations.id, escalation.id));
+        }
       }
 
       return inspect({ sessionId: session.id });
@@ -953,14 +1043,32 @@ export function standupService(db: Db) {
       const processed: Array<typeof standupOutboxJobs.$inferSelect> = [];
       for (const job of jobs) {
         const attempts = job.attempts + 1;
+        const delivery: OutboxDeliveryResult = input.deliver
+          ? await input.deliver(job)
+          : {
+            ok: false,
+            error: "delivery_adapter_missing",
+            retryAt: nextRetryAt(now, attempts),
+          };
+        const failedPermanently = !delivery.ok && attempts >= job.maxAttempts;
+        const proofId = delivery.ok ? deliveryProofId(job, attempts, delivery.proofId) : null;
         const [updated] = await db
           .update(standupOutboxJobs)
           .set({
-            status: attempts > job.maxAttempts ? "dead_lettered" : "succeeded",
+            status: delivery.ok ? "succeeded" : failedPermanently ? "dead_lettered" : "failed",
             attempts,
             lastAttemptAt: now,
-            deliveredAt: attempts > job.maxAttempts ? null : now,
-            deadLetteredAt: attempts > job.maxAttempts ? now : null,
+            deliveredAt: delivery.ok ? now : null,
+            deadLetteredAt: failedPermanently ? now : null,
+            lastError: delivery.ok ? null : delivery.error ?? "delivery_failed",
+            nextAttemptAt: delivery.ok ? job.nextAttemptAt : delivery.retryAt ?? nextRetryAt(now, attempts),
+            payload: delivery.ok
+              ? {
+                ...asRecord(job.payload),
+                deliveryProofId: proofId,
+                deliveredAt: now.toISOString(),
+              }
+              : job.payload,
             updatedAt: now,
           })
           .where(eq(standupOutboxJobs.id, job.id))
@@ -983,6 +1091,12 @@ export function standupService(db: Db) {
             .update(standupParticipants)
             .set({ deliveryStatus: "delivered", updatedAt: now })
             .where(eq(standupParticipants.id, updated.participantId));
+        }
+        if (updated.escalationId && updated.jobType === "escalation_wakeup" && updated.status === "succeeded") {
+          await db
+            .update(standupEscalations)
+            .set({ deliveryProofId: proofId, updatedAt: now })
+            .where(eq(standupEscalations.id, updated.escalationId));
         }
         processed.push(updated);
       }

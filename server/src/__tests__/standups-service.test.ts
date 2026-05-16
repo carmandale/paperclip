@@ -61,7 +61,7 @@ describeEmbeddedPostgres("standupService", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompany() {
+  async function seedCompany(options: { participantAgentIds?: string[] } = {}) {
     const companyId = randomUUID();
     const opsId = randomUUID();
     const ceoId = randomUUID();
@@ -145,7 +145,7 @@ describeEmbeddedPostgres("standupService", () => {
       recoveryByLocalTime: "09:00",
       responseDueLocalTime: "10:00",
       escalationDueLocalTime: "10:15",
-      participantAgentIds: [ceoId, croId],
+      participantAgentIds: options.participantAgentIds ?? [ceoId, croId],
       responseSchema: { required: ["whatHappened", "why", "nextAction", "owner", "dueTime", "proofTarget"] },
       genericAnswerDenylist: ["monitoring", "awaiting directives"],
       nonGreenTriggerRule: { source: "car-loop-recovery" },
@@ -228,6 +228,23 @@ describeEmbeddedPostgres("standupService", () => {
     expect(rejected.valid).toBe(false);
     expect(rejected.rejectedReason).toBe("generic_answer_denylist");
 
+    const schemaRejected = await svc.submitResponse({
+      sessionId: inspection.session!.id,
+      participantId: ceoParticipant!.id,
+      actorRunId: seed.ceoRunId,
+      response: {
+        whatHappened: "Generator failed to produce a useful CAR candidate.",
+        why: "The loop returned generic analysis instead of a bounded experiment.",
+        nextAction: "Run one generator probe and attach the output.",
+        owner: "CEO",
+        dueTime: "2026-05-16T17:00:00.000Z",
+        blockerOrAuthorityGap: "No live-capital authority is needed.",
+        immediateActionTaken: "Created the action issue.",
+      } as any,
+    }, { agentId: seed.ceoId });
+    expect(schemaRejected.valid).toBe(false);
+    expect(schemaRejected.rejectedReason).toBe("response_schema_invalid");
+
     const afterSla = await svc.evaluateSla({
       sessionId: inspection.session!.id,
       now: "2026-05-16T16:00:00.000Z",
@@ -237,6 +254,14 @@ describeEmbeddedPostgres("standupService", () => {
     expect(afterSla.escalations).toHaveLength(2);
     expect(afterSla.escalations.every((escalation) => escalation.actingOwnerAgentId === seed.opsId)).toBe(true);
     expect(afterSla.escalations.every((escalation) => escalation.escalationIssueId)).toBe(true);
+    expect(afterSla.escalations.every((escalation) => escalation.deliveryProofId?.startsWith("outbox:"))).toBe(true);
+
+    await svc.processOutbox({
+      limit: 10,
+      deliver: async (job) => ({ ok: true, proofId: `delivered:${job.id}` }),
+    });
+    const afterDelivery = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterDelivery.escalations.every((escalation) => escalation.deliveryProofId?.startsWith("delivered:"))).toBe(true);
   });
 
   it("creates deduped owner actions and makes outbox processing/replay inspectable", async () => {
@@ -269,7 +294,10 @@ describeEmbeddedPostgres("standupService", () => {
     expect(afterAction.action_taken).toBe(true);
     expect(afterAction.actions).toHaveLength(1);
 
-    const processed = await svc.processOutbox({ limit: 10 });
+    const processed = await svc.processOutbox({
+      limit: 10,
+      deliver: async (job) => ({ ok: true, proofId: `delivered:${job.id}` }),
+    });
     expect(processed.length).toBeGreaterThanOrEqual(3);
     expect(processed.every((job) => job.status === "succeeded")).toBe(true);
 
@@ -283,5 +311,68 @@ describeEmbeddedPostgres("standupService", () => {
     });
     expect(replay.replayOfJobId).toBe(processed[0].id);
     expect(replay.status).toBe("queued");
+  });
+
+  it("does not mark outbox jobs delivered without a real delivery result", async () => {
+    const seed = await seedCompany();
+    const inspection = await fireSeededStandup(seed);
+    const now = new Date("2026-05-16T15:30:00.000Z");
+
+    const failed = await svc.processOutbox({ limit: 1, now });
+
+    expect(failed).toHaveLength(1);
+    expect(failed[0].status).toBe("failed");
+    expect(failed[0].lastError).toBe("delivery_adapter_missing");
+
+    let afterFailure = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterFailure.participants.every((participant) => participant.deliveryStatus === "delivered")).toBe(false);
+
+    await db
+      .update(standupOutboxJobs)
+      .set({
+        maxAttempts: 2,
+        nextAttemptAt: new Date("2026-05-16T15:31:00.000Z"),
+      })
+      .where(eq(standupOutboxJobs.id, failed[0].id));
+
+    const deadLettered = await svc.processOutbox({
+      limit: 1,
+      now: new Date("2026-05-16T15:31:00.000Z"),
+      deliver: async () => ({ ok: false, error: "agent wake failed" }),
+    });
+
+    expect(deadLettered).toHaveLength(1);
+    expect(deadLettered[0].status).toBe("dead_lettered");
+    afterFailure = await svc.inspect({ sessionId: inspection.session!.id });
+    expect(afterFailure.deadLetters).toHaveLength(1);
+    expect(afterFailure.partial_failure).toBe(true);
+  });
+
+  it("keeps fire-time failures inspectable instead of disappearing", async () => {
+    const baseSeed = await seedCompany();
+    await db.delete(standupPolicies);
+    await svc.upsertPolicy(baseSeed.companyId, {
+      policyKey: "car-daily",
+      title: "CAR daily standup",
+      timezone: "America/Chicago",
+      scheduleCron: "30 8 * * *",
+      recoveryByLocalTime: "09:00",
+      responseDueLocalTime: "10:00",
+      escalationDueLocalTime: "10:15",
+      participantAgentIds: [baseSeed.ceoId, baseSeed.ceoId],
+      responseSchema: { required: ["whatHappened", "why", "nextAction", "owner", "dueTime", "proofTarget"] },
+      genericAnswerDenylist: ["monitoring", "awaiting directives"],
+      nonGreenTriggerRule: { source: "car-loop-recovery" },
+      actionRouting: { missing_response: { actingOwnerAgentId: baseSeed.opsId } },
+      disableSettings: { drainMode: "drain" },
+      serviceRunId: baseSeed.serviceRunId,
+    });
+
+    const inspection = await fireSeededStandup(baseSeed);
+
+    expect(inspection.session?.status).toBe("failed");
+    expect(inspection.standup_forced).toBe(false);
+    expect(inspection.partial_failure).toBe(true);
+    expect(inspection.session?.failureReason).toContain("standup_participants_session_agent_uq");
   });
 });
