@@ -389,6 +389,40 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
   });
 
+  it("does not mark normal scheduled linked standups as missed recovery", async () => {
+    const fixture = await seedFixture();
+    const standups = await linkStandupPolicy(fixture);
+    const { trigger } = await fixture.svc.createTrigger(
+      fixture.routine.id,
+      {
+        kind: "schedule",
+        label: "Daily 08:30",
+        cronExpression: "30 8 * * *",
+        timezone: "America/Chicago",
+      },
+      {},
+    );
+    const scheduledFor = new Date("2026-05-16T13:30:00.000Z");
+    const tickedAt = new Date("2026-05-16T13:30:30.000Z");
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: scheduledFor })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    const result = await fixture.svc.tickScheduledTriggers(tickedAt);
+
+    expect(result.triggered).toBe(1);
+    const [session] = await db.select().from(standupSessions);
+    const runs = await fixture.svc.listRuns(fixture.routine.id);
+    expect(runs[0]?.triggeredAt.toISOString()).toBe(tickedAt.toISOString());
+
+    const inspection = await standups.inspect({ sessionId: session!.id });
+    expect(inspection.session?.triggerConditionSnapshot).toMatchObject({
+      scheduledFor: scheduledFor.toISOString(),
+      missedRunRecovered: false,
+    });
+  });
+
   it("waits for the assignee wakeup to be queued before returning the routine run", async () => {
     let wakeupResolved = false;
     const { routine, svc } = await seedFixture({

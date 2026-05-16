@@ -48,6 +48,7 @@ const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blo
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
+const SCHEDULED_RUN_ON_TIME_GRACE_MS = 90_000;
 const WEEKDAY_INDEX: Record<string, number> = {
   Sun: 0,
   Mon: 1,
@@ -305,6 +306,27 @@ function nonEmptyRecordOr(value: unknown, fallback: Record<string, unknown>) {
 function optionalString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
+
+function isMissedScheduledOccurrence(scheduledFor: Date | null | undefined, firedAt: Date) {
+  if (!scheduledFor) return false;
+  // Cron is minute-granular; allow normal scheduler lag before labeling recovery.
+  return firedAt.getTime() - scheduledFor.getTime() > SCHEDULED_RUN_ON_TIME_GRACE_MS;
+}
+
+type DispatchRoutineRunInput = {
+  routine: typeof routines.$inferSelect;
+  trigger: typeof routineTriggers.$inferSelect | null;
+  source: "schedule" | "manual" | "api" | "webhook";
+  payload?: Record<string, unknown> | null;
+  variables?: Record<string, unknown> | null;
+  idempotencyKey?: string | null;
+  triggeredAt?: Date;
+  scheduledFor?: Date | null;
+  missedRunRecovered?: boolean;
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceSettings?: Record<string, unknown> | null;
+};
 
 export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
   const issueSvc = issueService(db);
@@ -723,16 +745,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
     return serviceRun.id;
   }
 
-  async function dispatchStandupRoutineRun(
-    input: {
-      routine: typeof routines.$inferSelect;
-      trigger: typeof routineTriggers.$inferSelect | null;
-      source: "schedule" | "manual" | "api" | "webhook";
-      payload?: Record<string, unknown> | null;
-      idempotencyKey?: string | null;
-    },
-    policy: typeof standupPolicies.$inferSelect,
-  ) {
+  async function dispatchStandupRoutineRun(input: DispatchRoutineRunInput, policy: typeof standupPolicies.$inferSelect) {
     const claim = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -758,7 +771,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
         if (existing) return { run: existing, existing: true, nextRunAt: undefined, triggeredAt: existing.triggeredAt };
       }
 
-      const triggeredAt = new Date();
+      const triggeredAt = input.triggeredAt ?? new Date();
       const [createdRun] = await txDb
         .insert(routineRuns)
         .values({
@@ -790,15 +803,20 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       routineRunId: claim.run.id,
       triggeredAt: claim.triggeredAt,
     });
-    const scheduledFor = input.trigger?.nextRunAt?.toISOString() ?? null;
+    const scheduledForDate = input.source === "schedule"
+      ? input.scheduledFor ?? input.trigger?.nextRunAt ?? null
+      : null;
+    const missedRunRecovered = input.source === "schedule"
+      ? input.missedRunRecovered ?? isMissedScheduledOccurrence(scheduledForDate, claim.triggeredAt)
+      : false;
     const triggerConditionSnapshot = nonEmptyRecordOr(payload.triggerConditionSnapshot, {
       source: "routine",
       routineId: input.routine.id,
       routineRunId: claim.run.id,
       triggerId: input.trigger?.id ?? null,
       triggerSource: input.source,
-      scheduledFor,
-      missedRunRecovered: input.source === "schedule" && !!input.trigger?.nextRunAt && input.trigger.nextRunAt < claim.triggeredAt,
+      scheduledFor: scheduledForDate?.toISOString() ?? null,
+      missedRunRecovered,
     });
     const assessmentSnapshot = nonEmptyRecordOr(payload.assessmentSnapshot, {
       source: "routine",
@@ -822,6 +840,8 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
           routineId: input.routine.id,
           routineRunId: claim.run.id,
           triggerId: input.trigger?.id ?? null,
+          scheduledFor: scheduledForDate?.toISOString() ?? null,
+          missedRunRecovered,
           idempotencyKey: input.idempotencyKey ?? null,
         },
         serviceRunId,
@@ -864,17 +884,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
     }
   }
 
-  async function dispatchRoutineRun(input: {
-    routine: typeof routines.$inferSelect;
-    trigger: typeof routineTriggers.$inferSelect | null;
-    source: "schedule" | "manual" | "api" | "webhook";
-    payload?: Record<string, unknown> | null;
-    variables?: Record<string, unknown> | null;
-    idempotencyKey?: string | null;
-    executionWorkspaceId?: string | null;
-    executionWorkspacePreference?: string | null;
-    executionWorkspaceSettings?: Record<string, unknown> | null;
-  }) {
+  async function dispatchRoutineRun(input: DispatchRoutineRunInput) {
     const resolvedVariables = resolveRoutineVariableValues(input.routine.variables ?? [], input);
     const triggerPayload = mergeRoutineRunPayload(input.payload, resolvedVariables);
     const linkedStandupPolicy = await getLinkedStandupPolicy(input.routine);
@@ -908,7 +918,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
         if (existing) return existing;
       }
 
-      const triggeredAt = new Date();
+      const triggeredAt = input.triggeredAt ?? new Date();
       const [createdRun] = await txDb
         .insert(routineRuns)
         .values({
@@ -1613,17 +1623,18 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
       for (const row of due) {
         if (!row.trigger.nextRunAt || !row.trigger.cronExpression || !row.trigger.timezone) continue;
 
-        let runCount = 1;
-        let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+        const scheduledOccurrences: Date[] = [];
+        let claimedNextRunAt: Date | null = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
 
         if (row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           let cursor: Date | null = row.trigger.nextRunAt;
-          runCount = 0;
-          while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
-            runCount += 1;
+          while (cursor && cursor <= now && scheduledOccurrences.length < MAX_CATCH_UP_RUNS) {
+            scheduledOccurrences.push(cursor);
             claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
             cursor = claimedNextRunAt;
           }
+        } else {
+          scheduledOccurrences.push(row.trigger.nextRunAt);
         }
 
         const claimed = await db
@@ -1643,11 +1654,15 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
           .then((rows) => rows[0] ?? null);
         if (!claimed) continue;
 
-        for (let i = 0; i < runCount; i += 1) {
+        for (const scheduledFor of scheduledOccurrences) {
           await dispatchRoutineRun({
             routine: row.routine,
             trigger: row.trigger,
             source: "schedule",
+            triggeredAt: now,
+            scheduledFor,
+            missedRunRecovered: isMissedScheduledOccurrence(scheduledFor, now),
+            idempotencyKey: `${row.trigger.id}:${scheduledFor.toISOString()}`,
           });
           triggered += 1;
         }
