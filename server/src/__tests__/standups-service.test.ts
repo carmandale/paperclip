@@ -201,6 +201,35 @@ describeEmbeddedPostgres("standupService", () => {
     expect(directiveIssues).toHaveLength(2);
   });
 
+  it("scopes policy-date inspect lookups by company", async () => {
+    const carSeed = await seedCompany();
+    const otherSeed = await seedCompany();
+    const carInspection = await fireSeededStandup(carSeed);
+    const otherInspection = await fireSeededStandup(otherSeed);
+
+    const carLookup = await svc.inspect({
+      companyId: carSeed.companyId,
+      policyKey: "car-daily",
+      localDate: "2026-05-16",
+    });
+    const otherLookup = await svc.inspect({
+      companyId: otherSeed.companyId,
+      policyKey: "car-daily",
+      localDate: "2026-05-16",
+    });
+    const unscopedLookup = await svc.inspect({
+      policyKey: "car-daily",
+      localDate: "2026-05-16",
+    } as any);
+
+    expect(carLookup.session?.id).toBe(carInspection.session?.id);
+    expect(carLookup.session?.companyId).toBe(carSeed.companyId);
+    expect(otherLookup.session?.id).toBe(otherInspection.session?.id);
+    expect(otherLookup.session?.companyId).toBe(otherSeed.companyId);
+    expect(unscopedLookup.session).toBeNull();
+    expect(unscopedLookup.missing_evidence).toContain("session");
+  });
+
   it("rejects generic participant responses and escalates missing accountability", async () => {
     const seed = await seedCompany();
     const inspection = await fireSeededStandup(seed);
@@ -316,7 +345,7 @@ describeEmbeddedPostgres("standupService", () => {
   it("does not mark outbox jobs delivered without a real delivery result", async () => {
     const seed = await seedCompany();
     const inspection = await fireSeededStandup(seed);
-    const now = new Date("2026-05-16T15:30:00.000Z");
+    const now = new Date("2026-05-16T16:30:00.000Z");
 
     const failed = await svc.processOutbox({ limit: 1, now });
 
@@ -331,13 +360,13 @@ describeEmbeddedPostgres("standupService", () => {
       .update(standupOutboxJobs)
       .set({
         maxAttempts: 2,
-        nextAttemptAt: new Date("2026-05-16T15:31:00.000Z"),
+        nextAttemptAt: new Date("2026-05-16T16:31:00.000Z"),
       })
       .where(eq(standupOutboxJobs.id, failed[0].id));
 
     const deadLettered = await svc.processOutbox({
       limit: 1,
-      now: new Date("2026-05-16T15:31:00.000Z"),
+      now: new Date("2026-05-16T16:31:00.000Z"),
       deliver: async () => ({ ok: false, error: "agent wake failed" }),
     });
 

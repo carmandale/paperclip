@@ -374,7 +374,7 @@ export function standupService(db: Db) {
         .from(standupSessions)
         .where(eq(standupSessions.id, input.sessionId))
         .then((rows) => rows[0] ?? null);
-    } else if (input.policyKey && input.localDate) {
+    } else if (input.companyId && input.policyKey && input.localDate) {
       session = await db
         .select({
           id: standupSessions.id,
@@ -409,6 +409,8 @@ export function standupService(db: Db) {
         .innerJoin(standupPolicies, eq(standupSessions.policyId, standupPolicies.id))
         .where(
           and(
+            eq(standupSessions.companyId, input.companyId),
+            eq(standupPolicies.companyId, input.companyId),
             eq(standupPolicies.policyKey, input.policyKey),
             eq(standupSessions.localDate, input.localDate),
             eq(standupSessions.standupType, input.standupType ?? "daily"),

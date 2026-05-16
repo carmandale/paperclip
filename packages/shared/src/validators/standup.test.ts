@@ -74,7 +74,8 @@ describe("standup validators", () => {
 
   it("keeps inspect read-only lookup grounded in a session or policy date", () => {
     expect(inspectStandupSchema.safeParse({ sessionId: uuidA }).success).toBe(true);
-    expect(inspectStandupSchema.safeParse({ policyKey: "car-daily", localDate: "2026-05-16" }).success).toBe(true);
+    expect(inspectStandupSchema.safeParse({ companyId: uuidA, policyKey: "car-daily", localDate: "2026-05-16" }).success).toBe(true);
+    expect(inspectStandupSchema.safeParse({ policyKey: "car-daily", localDate: "2026-05-16" }).success).toBe(false);
     expect(inspectStandupSchema.safeParse({ policyKey: "car-daily" }).success).toBe(false);
   });
 

@@ -91,12 +91,13 @@ export const createStandupActionSchema = z.object({
 export type CreateStandupAction = z.infer<typeof createStandupActionSchema>;
 
 export const inspectStandupSchema = z.object({
+  companyId: z.string().uuid().optional(),
   policyKey: z.string().trim().min(1).max(120).optional(),
   sessionId: z.string().uuid().optional(),
   localDate: localDateSchema.optional(),
   standupType: z.string().trim().min(1).max(80).optional(),
-}).refine((value) => value.sessionId || (value.policyKey && value.localDate), {
-  message: "Provide sessionId or policyKey plus localDate",
+}).refine((value) => value.sessionId || (value.companyId && value.policyKey && value.localDate), {
+  message: "Provide sessionId or companyId plus policyKey plus localDate",
 });
 
 export type InspectStandup = z.infer<typeof inspectStandupSchema>;
