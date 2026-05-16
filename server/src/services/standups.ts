@@ -515,6 +515,13 @@ export function standupService(db: Db) {
     getPolicy: (companyId: string, policyKey: string, standupType = "daily") =>
       getPolicyByKey(db, companyId, policyKey, standupType),
 
+    getOutboxJob: async (jobId: string) =>
+      db
+        .select()
+        .from(standupOutboxJobs)
+        .where(eq(standupOutboxJobs.id, jobId))
+        .then((rows) => rows[0] ?? null),
+
     upsertPolicy: async (companyId: string, input: UpsertStandupPolicy, actor: Actor = {}) => {
       assertTimeZone(input.timezone);
       const cronError = validateCron(input.scheduleCron);
