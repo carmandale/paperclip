@@ -6,11 +6,16 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   companies,
   createDb,
+  agents,
+  agentWakeupRequests,
   directExecContextBundles,
   directExecThreads,
   documents,
+  heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueLabels,
+  labels,
   issues,
 } from "@paperclipai/db";
 import { DIRECT_EXEC_ANSWER_CATEGORIES, upsertDirectExecContextBundleSchema } from "@paperclipai/shared";
@@ -88,7 +93,12 @@ describeEmbeddedPostgres("direct-exec routes", () => {
     await db.delete(issueDocuments);
     await db.delete(documents);
     await db.delete(issueComments);
+    await db.delete(issueLabels);
     await db.delete(issues);
+    await db.delete(agentWakeupRequests);
+    await db.delete(heartbeatRuns);
+    await db.delete(labels);
+    await db.delete(agents);
     await db.update(companies).set({ issueCounter: 0 }).where(eq(companies.id, companyId));
   });
 
@@ -226,11 +236,12 @@ describeEmbeddedPostgres("direct-exec routes", () => {
     expect(listed.body[0].id).toBe(first.body.thread.id);
   });
 
-  it("keeps direct-exec lifecycle status explicit and transition-checked", async () => {
+  it("keeps every direct-exec lifecycle status explicit and transition-checked", async () => {
     const created = await request(app)
       .post(`/api/companies/${companyId}/direct-exec/threads`)
       .send(directExecPayload());
     const threadId = created.body.thread.id;
+    const seenStatuses = new Set<string>([created.body.thread.lifecycle.status]);
 
     for (const status of ["queued", "pending", "completed"] as const) {
       const update = await request(app)
@@ -238,6 +249,7 @@ describeEmbeddedPostgres("direct-exec routes", () => {
         .send({ status });
       expect(update.status, JSON.stringify(update.body)).toBe(200);
       expect(update.body.lifecycle.status).toBe(status);
+      seenStatuses.add(update.body.lifecycle.status);
     }
 
     const rejected = await request(app)
@@ -251,6 +263,55 @@ describeEmbeddedPostgres("direct-exec routes", () => {
       .where(eq(issues.id, created.body.thread.issueId))
       .then((rows) => rows[0]);
     expect((storedIssue.executionState as any).directExec.status).toBe("completed");
+
+    const failed = await request(app)
+      .post(`/api/companies/${companyId}/direct-exec/threads`)
+      .send({
+        ...directExecPayload(),
+        source: { ...directExecPayload().source, messageId: "6342" },
+      });
+    const failedUpdate = await request(app)
+      .patch(`/api/direct-exec/threads/${failed.body.thread.id}/lifecycle`)
+      .send({ status: "failed", statusReason: "target rejected the request" });
+    expect(failedUpdate.status, JSON.stringify(failedUpdate.body)).toBe(200);
+    expect(failedUpdate.body.lifecycle.statusReason).toBe("target rejected the request");
+    seenStatuses.add(failedUpdate.body.lifecycle.status);
+
+    const paused = await request(app)
+      .post(`/api/companies/${companyId}/direct-exec/threads`)
+      .send({
+        ...directExecPayload(),
+        source: { ...directExecPayload().source, messageId: "6343" },
+      });
+    const pausedUpdate = await request(app)
+      .patch(`/api/direct-exec/threads/${paused.body.thread.id}/lifecycle`)
+      .send({ status: "paused" });
+    expect(pausedUpdate.status, JSON.stringify(pausedUpdate.body)).toBe(200);
+    seenStatuses.add(pausedUpdate.body.lifecycle.status);
+
+    const timedOut = await request(app)
+      .post(`/api/companies/${companyId}/direct-exec/threads`)
+      .send({
+        ...directExecPayload(),
+        source: { ...directExecPayload().source, messageId: "6344" },
+      });
+    for (const status of ["queued", "pending", "timed-out"] as const) {
+      const update = await request(app)
+        .patch(`/api/direct-exec/threads/${timedOut.body.thread.id}/lifecycle`)
+        .send({ status });
+      expect(update.status, JSON.stringify(update.body)).toBe(200);
+      seenStatuses.add(update.body.lifecycle.status);
+    }
+
+    expect([...seenStatuses].sort()).toEqual([
+      "accepted",
+      "completed",
+      "failed",
+      "paused",
+      "pending",
+      "queued",
+      "timed-out",
+    ]);
   });
 
   it("does not infer a lifecycle from origin fields or trace-like description text", async () => {
@@ -336,6 +397,24 @@ describeEmbeddedPostgres("direct-exec routes", () => {
 
     const referencedIssueId = randomUUID();
     const documentId = randomUUID();
+    const targetAgentId = randomUUID();
+    const executionRunId = randomUUID();
+    const labelId = randomUUID();
+    await db.insert(agents).values({
+      id: targetAgentId,
+      companyId,
+      name: "CEO",
+      role: "executive",
+      adapterType: "process",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: executionRunId,
+      companyId,
+      agentId: targetAgentId,
+      status: "completed",
+      invocationSource: "wakeup",
+      triggerDetail: "direct-exec issue context",
+    });
     await db.insert(issues).values({
       id: referencedIssueId,
       companyId,
@@ -344,12 +423,27 @@ describeEmbeddedPostgres("direct-exec routes", () => {
       description: "Redacted issue context",
       status: "blocked",
       priority: "high",
+      assigneeAgentId: targetAgentId,
+      executionRunId,
+    });
+    await db.insert(labels).values({
+      id: labelId,
+      companyId,
+      name: "executive",
+      color: "#0f766e",
+    });
+    await db.insert(issueLabels).values({
+      companyId,
+      issueId: referencedIssueId,
+      labelId,
     });
     await db.insert(issueComments).values({
       companyId,
       issueId: referencedIssueId,
       body: "Target-authored detail is intentionally not copied into the direct-exec test assertion.",
       authorType: "agent",
+      authorAgentId: targetAgentId,
+      createdByRunId: executionRunId,
     });
     await db.insert(documents).values({
       id: documentId,
@@ -365,11 +459,21 @@ describeEmbeddedPostgres("direct-exec routes", () => {
       documentId,
       key: "evidence",
     });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: targetAgentId,
+      source: "direct_exec",
+      triggerDetail: "CAR-1011",
+      payload: { issueId: referencedIssueId },
+      status: "claimed",
+      runId: executionRunId,
+    });
 
     const bundle = await request(app)
       .post(`/api/direct-exec/threads/${threadId}/context-bundle/assemble`)
       .send({
         issueRefs: ["CAR-1011"],
+        targetAgentIds: [targetAgentId],
         answerCategory: "did_not_act",
         answerEvidence: {
           did_not_act: [{
@@ -388,7 +492,13 @@ describeEmbeddedPostgres("direct-exec routes", () => {
       expect.objectContaining({
         sourceName: "paperclip.issue",
         kind: "issue",
-        data: expect.objectContaining({ identifier: "CAR-1011", status: "blocked" }),
+        data: expect.objectContaining({
+          identifier: "CAR-1011",
+          status: "blocked",
+          assigneeAgentId: targetAgentId,
+          executionRunId,
+          labelNames: ["executive"],
+        }),
       }),
       expect.objectContaining({
         sourceName: "paperclip.issue.comments",
@@ -399,6 +509,22 @@ describeEmbeddedPostgres("direct-exec routes", () => {
         sourceName: "paperclip.issue.documents",
         kind: "documents",
         data: expect.objectContaining({ documents: expect.arrayContaining([expect.objectContaining({ key: "evidence" })]) }),
+      }),
+      expect.objectContaining({
+        sourceName: "agent_wakeup_requests",
+        kind: "wakeups",
+        data: expect.objectContaining({ wakeups: expect.arrayContaining([expect.objectContaining({ runId: executionRunId })]) }),
+      }),
+      expect.objectContaining({
+        sourceName: "heartbeat_runs",
+        kind: "runs",
+        data: expect.objectContaining({ runs: expect.arrayContaining([expect.objectContaining({ id: executionRunId })]) }),
+      }),
+      expect.objectContaining({
+        sourceName: "target_agent.heartbeat_runs",
+        sourceId: targetAgentId,
+        kind: "runs",
+        data: expect.objectContaining({ runs: expect.arrayContaining([expect.objectContaining({ id: executionRunId })]) }),
       }),
     ]));
   });
