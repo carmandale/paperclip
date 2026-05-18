@@ -24,6 +24,7 @@ import {
   checkoutIssueSchema,
   createChildIssueSchema,
   createIssueSchema,
+  createDirectExecThreadSchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
   feedbackTargetTypeSchema,
@@ -39,6 +40,8 @@ import {
   updateIssueWorkProductSchema,
   upsertIssueDocumentSchema,
   updateIssueSchema,
+  updateDirectExecLifecycleSchema,
+  upsertDirectExecContextBundleSchema,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
@@ -68,6 +71,7 @@ import {
   ISSUE_LIST_MAX_LIMIT,
   issueReferenceService,
   issueService,
+  directExecService,
   clampIssueListLimit,
   documentService,
   logActivity,
@@ -834,6 +838,7 @@ export function issueRoutes(
 ) {
   const router = Router();
   const svc = issueService(db);
+  const directExecSvc = directExecService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
@@ -2992,6 +2997,130 @@ export function issueRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  router.get("/companies/:companyId/direct-exec/threads", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const threads = await directExecSvc.listThreads(companyId, {
+      originId: typeof req.query.originId === "string" ? req.query.originId : undefined,
+      dedupeKey: typeof req.query.dedupeKey === "string" ? req.query.dedupeKey : undefined,
+    });
+    res.json(threads);
+  });
+
+  router.post("/companies/:companyId/direct-exec/threads", validate(createDirectExecThreadSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const result = await directExecSvc.createOrGetThread(companyId, req.body);
+
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: result.created ? "direct_exec.thread_created" : "direct_exec.thread_reused",
+      entityType: "issue",
+      entityId: result.thread.issueId ?? result.thread.id,
+      details: {
+        directExecThreadId: result.thread.id,
+        originId: result.thread.originId,
+        dedupeKey: result.thread.lifecycle.dedupeKey,
+        status: result.thread.lifecycle.status,
+        targetAlias: result.thread.lifecycle.target.alias,
+        visibility: result.thread.lifecycle.visibility,
+      },
+    });
+
+    res.status(result.created ? 201 : 200).json(result);
+  });
+
+  router.get("/direct-exec/threads/:id", async (req, res) => {
+    const thread = await directExecSvc.getThread(req.params.id as string);
+    if (!thread) {
+      res.status(404).json({ error: "Direct-exec thread not found" });
+      return;
+    }
+    assertCompanyAccess(req, thread.companyId);
+    res.json(thread);
+  });
+
+  router.get("/issues/:id/direct-exec/thread", async (req, res) => {
+    const issue = await svc.getById(req.params.id as string);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const thread = await directExecSvc.getThreadByIssueId(issue.id);
+    if (!thread) {
+      res.status(404).json({ error: "Direct-exec thread not found" });
+      return;
+    }
+    res.json(thread);
+  });
+
+  router.patch("/direct-exec/threads/:id/lifecycle", validate(updateDirectExecLifecycleSchema), async (req, res) => {
+    const previous = await directExecSvc.getThread(req.params.id as string);
+    if (!previous) {
+      res.status(404).json({ error: "Direct-exec thread not found" });
+      return;
+    }
+    assertCompanyAccess(req, previous.companyId);
+    const actor = getActorInfo(req);
+    const updated = await directExecSvc.updateLifecycle(previous.id, req.body);
+
+    await logActivity(db, {
+      companyId: previous.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "direct_exec.lifecycle_updated",
+      entityType: "issue",
+      entityId: updated.issueId ?? updated.id,
+      details: {
+        directExecThreadId: updated.id,
+        previousStatus: previous.lifecycle.status,
+        status: updated.lifecycle.status,
+        statusReason: updated.lifecycle.statusReason,
+      },
+    });
+
+    res.json(updated);
+  });
+
+  router.put("/direct-exec/threads/:id/context-bundle", validate(upsertDirectExecContextBundleSchema), async (req, res) => {
+    const previous = await directExecSvc.getThread(req.params.id as string);
+    if (!previous) {
+      res.status(404).json({ error: "Direct-exec thread not found" });
+      return;
+    }
+    assertCompanyAccess(req, previous.companyId);
+    const actor = getActorInfo(req);
+    const bundle = await directExecSvc.upsertContextBundle(previous.id, req.body);
+
+    await logActivity(db, {
+      companyId: previous.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "direct_exec.context_bundle_upserted",
+      entityType: "issue",
+      entityId: previous.issueId ?? previous.id,
+      details: {
+        directExecThreadId: previous.id,
+        contextBundleId: bundle.id,
+        sourceCount: bundle.sources.length,
+        conflictCount: bundle.conflicts.length,
+        answerCategory: bundle.answerCategory,
+      },
+    });
+
+    res.json(bundle);
   });
 
   router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
