@@ -1,10 +1,23 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { directExecContextBundles, directExecThreads, issues } from "@paperclipai/db";
+import {
+  agentWakeupRequests,
+  directExecContextBundles,
+  directExecThreads,
+  documents,
+  heartbeatRuns,
+  issueComments,
+  issueDocuments,
+  issueLabels,
+  issues,
+  labels,
+} from "@paperclipai/db";
 import type {
+  AssembleDirectExecContextBundle,
   CreateDirectExecThread,
   DirectExecContextBundle,
   DirectExecContextConflict,
+  DirectExecContextItem,
   DirectExecContextSourceFreshness,
   DirectExecLifecycle,
   DirectExecLifecycleStatus,
@@ -15,7 +28,9 @@ import type {
 } from "@paperclipai/shared";
 import {
   DIRECT_EXEC_DEFAULT_THRESHOLDS,
+  assembleDirectExecContextBundleSchema,
   upsertDirectExecContextBundleSchema,
+  isUuidLike,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { issueService } from "./issues.js";
@@ -146,6 +161,50 @@ function normalizeContextConflicts(conflicts: UpsertDirectExecContextBundle["con
   }));
 }
 
+function freshSource(
+  sourceName: string,
+  sourceId: string,
+  maxAgeSeconds: number,
+  now = new Date(),
+): DirectExecContextSourceFreshness {
+  return {
+    sourceName,
+    sourceId,
+    fetchedAt: now.toISOString(),
+    maxAgeSeconds,
+    stale: false,
+    unavailableReason: null,
+    errorReason: null,
+  };
+}
+
+function unavailableSource(
+  sourceName: string,
+  sourceId: string,
+  maxAgeSeconds: number,
+  reason: string,
+  now = new Date(),
+): DirectExecContextSourceFreshness {
+  return {
+    sourceName,
+    sourceId,
+    fetchedAt: now.toISOString(),
+    maxAgeSeconds,
+    stale: true,
+    unavailableReason: reason,
+    errorReason: null,
+  };
+}
+
+function contextItem(
+  sourceName: string,
+  sourceId: string,
+  kind: string,
+  data: Record<string, unknown>,
+): DirectExecContextItem {
+  return { sourceName, sourceId, kind, data };
+}
+
 async function updateIssueDirectExecState(
   db: Db,
   thread: typeof directExecThreads.$inferSelect,
@@ -182,6 +241,7 @@ function toContextBundle(row: typeof directExecContextBundles.$inferSelect): Dir
     directExecThreadId: row.directExecThreadId,
     issueId: row.issueId,
     sources: row.sources,
+    items: row.items,
     conflicts: row.conflicts,
     answerCategory: row.answerCategory as DirectExecContextBundle["answerCategory"],
     answerEvidence: row.answerEvidence,
@@ -239,6 +299,161 @@ async function getIssueByDirectExecOrigin(db: Db, companyId: string, originId: s
       eq(issues.originId, originId),
     ))
     .then((rows) => rows[0] ?? null);
+}
+
+async function findReferencedIssue(db: Db, companyId: string, ref: string) {
+  const predicates = [eq(issues.identifier, ref)];
+  if (isUuidLike(ref)) predicates.push(eq(issues.id, ref));
+  return db
+    .select()
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), or(...predicates)))
+    .then((rows) => rows[0] ?? null);
+}
+
+async function assemblePaperclipIssueContext(
+  db: Db,
+  companyId: string,
+  ref: string,
+  maxAgeSeconds: number,
+) {
+  const sourceName = "paperclip.issue";
+  const issue = await findReferencedIssue(db, companyId, ref);
+  if (!issue) {
+    return {
+      sources: [unavailableSource(sourceName, ref, maxAgeSeconds, "Referenced issue was not found")],
+      items: [],
+    };
+  }
+
+  const [labelRows, commentRows, documentRows, wakeRows] = await Promise.all([
+    db
+      .select({ name: labels.name, color: labels.color })
+      .from(issueLabels)
+      .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+      .where(and(eq(issueLabels.companyId, companyId), eq(issueLabels.issueId, issue.id))),
+    db
+      .select({
+        id: issueComments.id,
+        authorAgentId: issueComments.authorAgentId,
+        authorUserId: issueComments.authorUserId,
+        authorType: issueComments.authorType,
+        createdByRunId: issueComments.createdByRunId,
+        createdAt: issueComments.createdAt,
+        updatedAt: issueComments.updatedAt,
+      })
+      .from(issueComments)
+      .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issue.id)))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(20),
+    db
+      .select({
+        documentId: documents.id,
+        key: issueDocuments.key,
+        title: documents.title,
+        latestRevisionId: documents.latestRevisionId,
+        latestRevisionNumber: documents.latestRevisionNumber,
+        updatedAt: documents.updatedAt,
+      })
+      .from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, issue.id))),
+    db
+      .select({
+        id: agentWakeupRequests.id,
+        agentId: agentWakeupRequests.agentId,
+        status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId,
+        requestedAt: agentWakeupRequests.requestedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+      )),
+  ]);
+
+  const runIds = [
+    issue.checkoutRunId,
+    issue.executionRunId,
+    ...commentRows.map((comment) => comment.createdByRunId),
+    ...wakeRows.map((wake) => wake.runId),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const runRows = runIds.length > 0
+    ? await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        invocationSource: heartbeatRuns.invocationSource,
+        triggerDetail: heartbeatRuns.triggerDetail,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, [...new Set(runIds)])))
+    : [];
+
+  return {
+    sources: [freshSource(sourceName, issue.identifier ?? issue.id, maxAgeSeconds)],
+    items: [
+      contextItem(sourceName, issue.identifier ?? issue.id, "issue", {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        status: issue.status,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        labelNames: labelRows.map((label) => label.name),
+        checkoutRunId: issue.checkoutRunId,
+        executionRunId: issue.executionRunId,
+        updatedAt: issue.updatedAt.toISOString(),
+      }),
+      contextItem("paperclip.issue.comments", issue.identifier ?? issue.id, "comments", {
+        comments: commentRows.map((comment) => ({
+          id: comment.id,
+          authorAgentId: comment.authorAgentId,
+          authorUserId: comment.authorUserId,
+          authorType: comment.authorType,
+          createdByRunId: comment.createdByRunId,
+          createdAt: comment.createdAt.toISOString(),
+          updatedAt: comment.updatedAt.toISOString(),
+        })),
+      }),
+      contextItem("paperclip.issue.documents", issue.identifier ?? issue.id, "documents", {
+        documents: documentRows.map((document) => ({
+          id: document.documentId,
+          key: document.key,
+          title: document.title,
+          latestRevisionId: document.latestRevisionId,
+          latestRevisionNumber: document.latestRevisionNumber,
+          updatedAt: document.updatedAt.toISOString(),
+        })),
+      }),
+      contextItem("agent_wakeup_requests", issue.identifier ?? issue.id, "wakeups", {
+        wakeups: wakeRows.map((wake) => ({
+          id: wake.id,
+          agentId: wake.agentId,
+          status: wake.status,
+          runId: wake.runId,
+          requestedAt: wake.requestedAt.toISOString(),
+        })),
+      }),
+      contextItem("heartbeat_runs", issue.identifier ?? issue.id, "runs", {
+        runs: runRows.map((run) => ({
+          id: run.id,
+          agentId: run.agentId,
+          status: run.status,
+          invocationSource: run.invocationSource,
+          triggerDetail: run.triggerDetail,
+          startedAt: run.startedAt?.toISOString() ?? null,
+          finishedAt: run.finishedAt?.toISOString() ?? null,
+          createdAt: run.createdAt.toISOString(),
+        })),
+      }),
+    ],
+  };
 }
 
 export function directExecService(db: Db) {
@@ -427,6 +642,7 @@ export function directExecService(db: Db) {
           directExecThreadId: thread.id,
           issueId: thread.issueId,
           sources,
+          items: parsed.items,
           conflicts,
           answerCategory: parsed.answerCategory ?? null,
           answerEvidence: parsed.answerEvidence,
@@ -440,6 +656,90 @@ export function directExecService(db: Db) {
       });
 
       return toContextBundle(bundle);
+    },
+
+    async assembleContextBundle(id: string, input: AssembleDirectExecContextBundle) {
+      const parsed = assembleDirectExecContextBundleSchema.parse(input);
+      const thread = await db
+        .select()
+        .from(directExecThreads)
+        .where(eq(directExecThreads.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!thread) throw notFound("Direct-exec thread not found");
+      if (!thread.issueId) throw unprocessable("Direct-exec thread is not linked to a Paperclip issue");
+
+      const lifecycle = thread.lifecycle as DirectExecLifecycle;
+      const thresholds = lifecycle.thresholds;
+      const assembledSources: DirectExecContextSourceFreshness[] = [];
+      const assembledItems: DirectExecContextItem[] = [];
+
+      for (const issueRef of parsed.issueRefs) {
+        const assembled = await assemblePaperclipIssueContext(
+          db,
+          thread.companyId,
+          issueRef,
+          thresholds.paperclipReadMaxAgeSeconds,
+        );
+        assembledSources.push(...assembled.sources);
+        assembledItems.push(...assembled.items);
+      }
+
+      for (const agentId of parsed.targetAgentIds) {
+        const runs = await db
+          .select({
+            id: heartbeatRuns.id,
+            agentId: heartbeatRuns.agentId,
+            status: heartbeatRuns.status,
+            invocationSource: heartbeatRuns.invocationSource,
+            triggerDetail: heartbeatRuns.triggerDetail,
+            startedAt: heartbeatRuns.startedAt,
+            finishedAt: heartbeatRuns.finishedAt,
+            createdAt: heartbeatRuns.createdAt,
+          })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.companyId, thread.companyId), eq(heartbeatRuns.agentId, agentId)))
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(5);
+        assembledSources.push(freshSource("target_agent.heartbeat_runs", agentId, thresholds.heartbeatFreshSeconds));
+        assembledItems.push(contextItem("target_agent.heartbeat_runs", agentId, "runs", {
+          runs: runs.map((run) => ({
+            id: run.id,
+            agentId: run.agentId,
+            status: run.status,
+            invocationSource: run.invocationSource,
+            triggerDetail: run.triggerDetail,
+            startedAt: run.startedAt?.toISOString() ?? null,
+            finishedAt: run.finishedAt?.toISOString() ?? null,
+            createdAt: run.createdAt.toISOString(),
+          })),
+        }));
+      }
+
+      for (const runtimeRef of parsed.runtimeRefs) {
+        assembledSources.push(unavailableSource(
+          runtimeRef.kind,
+          runtimeRef.id,
+          thresholds.runtimeStatusMaxAgeSeconds,
+          "Runtime status is only assembled when a named Paperclip issue or runtime adapter supplies live status evidence",
+        ));
+      }
+
+      if (assembledSources.length === 0) {
+        assembledSources.push(unavailableSource(
+          "paperclip.issue",
+          thread.issueId,
+          thresholds.paperclipReadMaxAgeSeconds,
+          "No referenced Paperclip issue, target agent, or runtime id was supplied for assembly",
+        ));
+      }
+
+      return this.upsertContextBundle(thread.id, {
+        sources: assembledSources,
+        items: assembledItems,
+        conflicts: [],
+        answerCategory: parsed.answerCategory,
+        answerEvidence: parsed.answerEvidence,
+      });
     },
   };
 }

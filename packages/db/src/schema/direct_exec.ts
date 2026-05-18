@@ -13,6 +13,7 @@ import { issues } from "./issues.js";
 import type {
   DirectExecAnswerEvidenceByCategory,
   DirectExecContextConflict,
+  DirectExecContextItem,
   DirectExecContextSourceFreshness,
   DirectExecLifecycle,
 } from "@paperclipai/shared";
@@ -63,6 +64,7 @@ export const directExecContextBundles = pgTable(
       .references(() => directExecThreads.id, { onDelete: "cascade" }),
     issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
     sources: jsonb("sources").notNull().$type<DirectExecContextSourceFreshness[]>(),
+    items: jsonb("items").notNull().$type<DirectExecContextItem[]>(),
     conflicts: jsonb("conflicts").notNull().$type<DirectExecContextConflict[]>(),
     answerCategory: text("answer_category"),
     answerEvidence: jsonb("answer_evidence").notNull().$type<DirectExecAnswerEvidenceByCategory>(),

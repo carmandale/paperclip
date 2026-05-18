@@ -81,6 +81,13 @@ export interface DirectExecContextConflict {
   evidence: string;
 }
 
+export interface DirectExecContextItem {
+  sourceName: string;
+  sourceId: string;
+  kind: string;
+  data: Record<string, unknown>;
+}
+
 export interface DirectExecAnswerEvidence {
   sourceName: string;
   sourceId: string;
@@ -97,6 +104,7 @@ export interface DirectExecContextBundle {
   directExecThreadId: string;
   issueId: string;
   sources: DirectExecContextSourceFreshness[];
+  items: DirectExecContextItem[];
   conflicts: DirectExecContextConflict[];
   answerCategory: DirectExecAnswerCategory | null;
   answerEvidence: DirectExecAnswerEvidenceByCategory;

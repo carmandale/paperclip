@@ -8,6 +8,9 @@ import {
   createDb,
   directExecContextBundles,
   directExecThreads,
+  documents,
+  issueComments,
+  issueDocuments,
   issues,
 } from "@paperclipai/db";
 import { DIRECT_EXEC_ANSWER_CATEGORIES, upsertDirectExecContextBundleSchema } from "@paperclipai/shared";
@@ -82,6 +85,9 @@ describeEmbeddedPostgres("direct-exec routes", () => {
   afterEach(async () => {
     await db.delete(directExecContextBundles);
     await db.delete(directExecThreads);
+    await db.delete(issueDocuments);
+    await db.delete(documents);
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.update(companies).set({ issueCounter: 0 }).where(eq(companies.id, companyId));
   });
@@ -320,5 +326,80 @@ describeEmbeddedPostgres("direct-exec routes", () => {
     expect(read.status, JSON.stringify(read.body)).toBe(200);
     expect(read.body.lifecycle.contextBundleId).toBe(bundle.body.id);
     expect(read.body.contextBundle.id).toBe(bundle.body.id);
+  });
+
+  it("assembles referenced Paperclip issue context inside Paperclip before persisting a bundle", async () => {
+    const created = await request(app)
+      .post(`/api/companies/${companyId}/direct-exec/threads`)
+      .send(directExecPayload());
+    const threadId = created.body.thread.id;
+
+    const referencedIssueId = randomUUID();
+    const documentId = randomUUID();
+    await db.insert(issues).values({
+      id: referencedIssueId,
+      companyId,
+      identifier: "CAR-1011",
+      title: "CEO follow-up",
+      description: "Redacted issue context",
+      status: "blocked",
+      priority: "high",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: referencedIssueId,
+      body: "Target-authored detail is intentionally not copied into the direct-exec test assertion.",
+      authorType: "agent",
+    });
+    await db.insert(documents).values({
+      id: documentId,
+      companyId,
+      title: "Evidence note",
+      latestBody: "Redacted document body",
+      latestRevisionNumber: 1,
+      format: "markdown",
+    });
+    await db.insert(issueDocuments).values({
+      companyId,
+      issueId: referencedIssueId,
+      documentId,
+      key: "evidence",
+    });
+
+    const bundle = await request(app)
+      .post(`/api/direct-exec/threads/${threadId}/context-bundle/assemble`)
+      .send({
+        issueRefs: ["CAR-1011"],
+        answerCategory: "did_not_act",
+        answerEvidence: {
+          did_not_act: [{
+            sourceName: "paperclip.issue",
+            sourceId: "CAR-1011",
+            detail: "Referenced issue status is blocked and no later target action is present.",
+          }],
+        },
+      });
+
+    expect(bundle.status, JSON.stringify(bundle.body)).toBe(200);
+    expect(bundle.body.sources).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceName: "paperclip.issue", sourceId: "CAR-1011", stale: false }),
+    ]));
+    expect(bundle.body.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sourceName: "paperclip.issue",
+        kind: "issue",
+        data: expect.objectContaining({ identifier: "CAR-1011", status: "blocked" }),
+      }),
+      expect.objectContaining({
+        sourceName: "paperclip.issue.comments",
+        kind: "comments",
+        data: expect.objectContaining({ comments: expect.arrayContaining([expect.objectContaining({ authorType: "agent" })]) }),
+      }),
+      expect.objectContaining({
+        sourceName: "paperclip.issue.documents",
+        kind: "documents",
+        data: expect.objectContaining({ documents: expect.arrayContaining([expect.objectContaining({ key: "evidence" })]) }),
+      }),
+    ]));
   });
 });

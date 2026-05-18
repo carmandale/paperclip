@@ -230,6 +230,7 @@ export type {
   DirectExecAnswerEvidenceByCategory,
   DirectExecContextBundle,
   DirectExecContextConflict,
+  DirectExecContextItem,
   DirectExecContextSourceFreshness,
   DirectExecDeliveryReceipt,
   DirectExecLifecycle,

@@ -224,11 +224,13 @@ export {
 
 export {
   DIRECT_EXEC_DEFAULT_THRESHOLDS,
+  assembleDirectExecContextBundleSchema,
   createDirectExecThreadSchema,
   directExecAnswerCategorySchema,
   directExecAnswerEvidenceByCategorySchema,
   directExecAnswerEvidenceSchema,
   directExecContextConflictSchema,
+  directExecContextItemSchema,
   directExecContextSourceSchema,
   directExecDeliveryReceiptSchema,
   directExecLifecycleStatusSchema,
@@ -240,6 +242,7 @@ export {
   directExecVisibilitySchema,
   updateDirectExecLifecycleSchema,
   upsertDirectExecContextBundleSchema,
+  type AssembleDirectExecContextBundle,
   type CreateDirectExecThread,
   type DirectExecThresholdsInput,
   type UpdateDirectExecLifecycle,

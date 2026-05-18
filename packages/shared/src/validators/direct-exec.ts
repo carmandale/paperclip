@@ -110,6 +110,13 @@ export const directExecContextConflictSchema = z.object({
   evidence: z.string().trim().min(1).max(2000),
 }).strict();
 
+export const directExecContextItemSchema = z.object({
+  sourceName: z.string().trim().min(1).max(160),
+  sourceId: z.string().trim().min(1).max(300),
+  kind: z.string().trim().min(1).max(120),
+  data: z.record(z.string(), z.unknown()).default({}),
+}).strict();
+
 export const directExecAnswerEvidenceSchema = z.object({
   sourceName: z.string().trim().min(1).max(160),
   sourceId: z.string().trim().min(1).max(300),
@@ -128,7 +135,29 @@ export const directExecAnswerEvidenceByCategorySchema = z
 
 export const upsertDirectExecContextBundleSchema = z.object({
   sources: z.array(directExecContextSourceSchema).min(1),
+  items: z.array(directExecContextItemSchema).optional().default([]),
   conflicts: z.array(directExecContextConflictSchema).default([]),
+  answerCategory: directExecAnswerCategorySchema.optional().nullable().default(null),
+  answerEvidence: directExecAnswerEvidenceByCategorySchema.default({}),
+}).strict().superRefine((value, ctx) => {
+  if (!value.answerCategory) return;
+  const categoryEvidence = value.answerEvidence[value.answerCategory];
+  if (!categoryEvidence || categoryEvidence.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["answerEvidence", value.answerCategory],
+      message: `answerCategory ${value.answerCategory} requires named evidence`,
+    });
+  }
+});
+
+export const assembleDirectExecContextBundleSchema = z.object({
+  issueRefs: z.array(z.string().trim().min(1).max(120)).default([]),
+  targetAgentIds: z.array(z.string().uuid()).default([]),
+  runtimeRefs: z.array(z.object({
+    kind: z.enum(["operator_runtime", "generator_runtime"]),
+    id: z.string().trim().min(1).max(200),
+  }).strict()).default([]),
   answerCategory: directExecAnswerCategorySchema.optional().nullable().default(null),
   answerEvidence: directExecAnswerEvidenceByCategorySchema.default({}),
 }).strict().superRefine((value, ctx) => {
@@ -146,4 +175,5 @@ export const upsertDirectExecContextBundleSchema = z.object({
 export type CreateDirectExecThread = z.infer<typeof createDirectExecThreadSchema>;
 export type UpdateDirectExecLifecycle = z.infer<typeof updateDirectExecLifecycleSchema>;
 export type UpsertDirectExecContextBundle = z.infer<typeof upsertDirectExecContextBundleSchema>;
+export type AssembleDirectExecContextBundle = z.infer<typeof assembleDirectExecContextBundleSchema>;
 export type DirectExecThresholdsInput = z.infer<typeof directExecThresholdsSchema>;

@@ -18,6 +18,7 @@ import {
   cancelIssueThreadInteractionSchema,
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
+  assembleDirectExecContextBundleSchema,
   createIssueThreadInteractionSchema,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
@@ -3116,6 +3117,37 @@ export function issueRoutes(
         contextBundleId: bundle.id,
         sourceCount: bundle.sources.length,
         conflictCount: bundle.conflicts.length,
+        answerCategory: bundle.answerCategory,
+      },
+    });
+
+    res.json(bundle);
+  });
+
+  router.post("/direct-exec/threads/:id/context-bundle/assemble", validate(assembleDirectExecContextBundleSchema), async (req, res) => {
+    const previous = await directExecSvc.getThread(req.params.id as string);
+    if (!previous) {
+      res.status(404).json({ error: "Direct-exec thread not found" });
+      return;
+    }
+    assertCompanyAccess(req, previous.companyId);
+    const actor = getActorInfo(req);
+    const bundle = await directExecSvc.assembleContextBundle(previous.id, req.body);
+
+    await logActivity(db, {
+      companyId: previous.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "direct_exec.context_bundle_assembled",
+      entityType: "issue",
+      entityId: previous.issueId ?? previous.id,
+      details: {
+        directExecThreadId: previous.id,
+        contextBundleId: bundle.id,
+        sourceCount: bundle.sources.length,
+        itemCount: bundle.items.length,
         answerCategory: bundle.answerCategory,
       },
     });

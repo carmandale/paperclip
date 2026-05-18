@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS "direct_exec_context_bundles" (
   "direct_exec_thread_id" uuid NOT NULL,
   "issue_id" uuid NOT NULL,
   "sources" jsonb NOT NULL,
+  "items" jsonb DEFAULT '[]'::jsonb NOT NULL,
   "conflicts" jsonb NOT NULL,
   "answer_category" text,
   "answer_evidence" jsonb NOT NULL,
