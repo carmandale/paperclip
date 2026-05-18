@@ -10,6 +10,7 @@ import {
   agentWakeupRequests,
   directExecContextBundles,
   directExecThreads,
+  documentRevisions,
   documents,
   heartbeatRuns,
   issueComments,
@@ -25,6 +26,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { scrubExpiredDirectExecPayloads } from "../services/direct-exec.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -527,5 +529,107 @@ describeEmbeddedPostgres("direct-exec routes", () => {
         data: expect.objectContaining({ runs: expect.arrayContaining([expect.objectContaining({ id: executionRunId })]) }),
       }),
     ]));
+  });
+
+  it("scrubs expired direct-exec payload fields while preserving delivery receipts and document revision hygiene", async () => {
+    const rawMarker = "RAW_TELEGRAM_AND_CONTEXT_PAYLOAD_DO_NOT_COPY";
+    const created = await request(app)
+      .post(`/api/companies/${companyId}/direct-exec/threads`)
+      .send({
+        ...directExecPayload(),
+        description: "Redacted executive intake; raw text omitted by policy.",
+        retentionExpiresAt: "2026-05-18T18:00:00.000Z",
+        scrubStatus: "pending",
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const threadId = created.body.thread.id;
+
+    const queued = await request(app)
+      .patch(`/api/direct-exec/threads/${threadId}/lifecycle`)
+      .send({
+        status: "queued",
+        deliveryReceipts: [{
+          id: "telegram-delivery-1",
+          channel: "telegram",
+          targetId: "telegram:6980882002",
+          deliveredAt: "2026-05-18T18:01:00.000Z",
+          status: "delivered",
+        }],
+      });
+    expect(queued.status, JSON.stringify(queued.body)).toBe(200);
+    expect(queued.body.lifecycle.deliveryReceipts).toHaveLength(1);
+
+    const bundle = await request(app)
+      .put(`/api/direct-exec/threads/${threadId}/context-bundle`)
+      .send({
+        sources: [{
+          sourceName: "paperclip.issue",
+          sourceId: "CAR-1011",
+          fetchedAt: "2026-05-18T18:01:00.000Z",
+          maxAgeSeconds: 60,
+        }],
+        items: [{
+          sourceName: "paperclip.issue",
+          sourceId: "CAR-1011",
+          kind: "raw_context_payload",
+          data: { raw: rawMarker },
+        }],
+        conflicts: [{
+          field: "body",
+          sources: ["telegram", "paperclip.issue"],
+          resolution: "unresolved",
+          evidence: rawMarker,
+        }],
+        answerCategory: "did_not_act",
+        answerEvidence: {
+          did_not_act: [{
+            sourceName: "paperclip.issue",
+            sourceId: "CAR-1011",
+            detail: rawMarker,
+          }],
+        },
+      });
+    expect(bundle.status, JSON.stringify(bundle.body)).toBe(200);
+
+    const beforeDocs = await db.select({ latestBody: documents.latestBody }).from(documents);
+    const beforeRevisions = await db.select({ body: documentRevisions.body }).from(documentRevisions);
+    expect(JSON.stringify({ beforeDocs, beforeRevisions })).not.toContain(rawMarker);
+
+    const scrub = await scrubExpiredDirectExecPayloads(db, { now: new Date("2026-05-18T19:00:00.000Z") });
+    expect(scrub.scrubbedThreadIds).toEqual([threadId]);
+    expect(scrub.scrubbedContextBundleCount).toBe(1);
+
+    const read = await request(app).get(`/api/direct-exec/threads/${threadId}`);
+    expect(read.status, JSON.stringify(read.body)).toBe(200);
+    expect(read.body.lifecycle).toMatchObject({
+      status: "queued",
+      scrubStatus: "scrubbed",
+      deliveryReceipts: [{
+        id: "telegram-delivery-1",
+        channel: "telegram",
+        targetId: "telegram:6980882002",
+        deliveredAt: "2026-05-18T18:01:00.000Z",
+        status: "delivered",
+        error: null,
+      }],
+    });
+    expect(read.body.contextBundle).toMatchObject({
+      sources: [expect.objectContaining({ sourceName: "paperclip.issue", sourceId: "CAR-1011" })],
+      items: [],
+      conflicts: [],
+      answerEvidence: {},
+    });
+    expect(JSON.stringify(read.body.contextBundle)).not.toContain(rawMarker);
+
+    const issueRow = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, created.body.thread.issueId))
+      .then((rows) => rows[0]);
+    expect((issueRow.executionState as any).directExec).toMatchObject({
+      status: "queued",
+      scrubStatus: "scrubbed",
+      deliveryReceiptIds: ["telegram-delivery-1"],
+    });
   });
 });

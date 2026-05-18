@@ -15,6 +15,7 @@ import {
 import type {
   AssembleDirectExecContextBundle,
   CreateDirectExecThread,
+  DirectExecAnswerEvidenceByCategory,
   DirectExecContextBundle,
   DirectExecContextConflict,
   DirectExecContextItem,
@@ -77,6 +78,11 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function isoNow(now = new Date()) {
   return now.toISOString();
+}
+
+export interface DirectExecRetentionScrubResult {
+  scrubbedThreadIds: string[];
+  scrubbedContextBundleCount: number;
 }
 
 function buildInitialLifecycle(input: CreateDirectExecThread, dedupeKey: string, now = new Date()): DirectExecLifecycle {
@@ -259,6 +265,66 @@ async function getLatestBundle(db: Db, threadId: string) {
     .limit(1)
     .then((rows) => rows[0] ?? null);
   return row ? toContextBundle(row) : null;
+}
+
+export async function scrubExpiredDirectExecPayloads(
+  db: Db,
+  options: { now?: Date; limit?: number } = {},
+): Promise<DirectExecRetentionScrubResult> {
+  const now = options.now ?? new Date();
+  const nowIso = isoNow(now);
+  const rows = await db
+    .select()
+    .from(directExecThreads)
+    .where(and(
+      eq(directExecThreads.originKind, "direct_exec"),
+      sql`${directExecThreads.lifecycle} ->> 'scrubStatus' = 'pending'`,
+      sql`${directExecThreads.lifecycle} ->> 'retentionExpiresAt' IS NOT NULL`,
+      sql`${directExecThreads.lifecycle} ->> 'retentionExpiresAt' <= ${nowIso}`,
+    ))
+    .limit(options.limit ?? 100);
+
+  const scrubbedThreadIds: string[] = [];
+  let scrubbedContextBundleCount = 0;
+
+  for (const row of rows) {
+    const lifecycle = row.lifecycle as DirectExecLifecycle;
+    if (lifecycle.scrubStatus !== "pending" || !lifecycle.retentionExpiresAt) continue;
+    if (Date.parse(lifecycle.retentionExpiresAt) > now.getTime()) continue;
+
+    const scrubbedLifecycle: DirectExecLifecycle = {
+      ...lifecycle,
+      scrubStatus: "scrubbed",
+      updatedAt: nowIso,
+    };
+
+    const scrubbedBundles = await db
+      .update(directExecContextBundles)
+      .set({
+        items: [],
+        conflicts: [],
+        answerEvidence: {} as DirectExecAnswerEvidenceByCategory,
+        updatedAt: now,
+      })
+      .where(eq(directExecContextBundles.directExecThreadId, row.id))
+      .returning({ id: directExecContextBundles.id });
+    scrubbedContextBundleCount += scrubbedBundles.length;
+
+    const [updated] = await db
+      .update(directExecThreads)
+      .set({
+        lifecycle: scrubbedLifecycle,
+        updatedAt: now,
+      })
+      .where(eq(directExecThreads.id, row.id))
+      .returning();
+    if (!updated) continue;
+
+    await updateIssueDirectExecState(db, updated);
+    scrubbedThreadIds.push(row.id);
+  }
+
+  return { scrubbedThreadIds, scrubbedContextBundleCount };
 }
 
 async function hydrateThread(
