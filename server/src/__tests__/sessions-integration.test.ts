@@ -796,6 +796,7 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       priority: "high",
       assigneeAgentId: fixture.participantAgentId,
       serviceRunId: unavailableRunId,
+      allowDirectFallback: true,
       actor: serviceActor(fixture.managerAgentId, unavailableRunId),
     });
     expect(unavailable.route.authorityPath).toBe("failed_router");
@@ -813,6 +814,7 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       priority: "high",
       assigneeAgentId: fixture.participantAgentId,
       serviceRunId: timedOutServiceRunId,
+      allowDirectFallback: true,
       actor: serviceActor(fixture.managerAgentId, timedOutServiceRunId),
     });
     expect(stale.route.authorityPath).toBe("failed_router");
@@ -830,6 +832,7 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       priority: "high",
       assigneeAgentId: fixture.participantAgentId,
       serviceRunId: revokedServiceRunId,
+      allowDirectFallback: true,
       actor: serviceActor(fixture.managerAgentId, revokedServiceRunId),
     });
     expect(failed.route.authorityPath).toBe("failed_router");
@@ -858,6 +861,7 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       priority: "high",
       assigneeAgentId: fixture.participantAgentId,
       serviceRunId: validServiceRunId,
+      allowDirectFallback: true,
       actor: serviceActor(fixture.managerAgentId, validServiceRunId),
     });
     expect(afterRollback.route.authorityPath).toBe("failed_router");

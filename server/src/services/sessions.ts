@@ -1371,7 +1371,7 @@ export function sessionService(db: Db) {
           throw forbidden("Session service task route actor must own serviceRunId");
         }
         blockedReason = authority.reason;
-        authorityPath = input.allowDirectFallback && assigneeAgentId ? "direct" : "failed_router";
+        authorityPath = "failed_router";
       }
     }
 
