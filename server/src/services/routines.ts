@@ -586,7 +586,6 @@ export function routineService(
   });
   const standupSvc = standupService(db);
   const sessionSvc = sessionService(db);
-  const sessionSvc = sessionService(db);
 
   async function getRoutineById(id: string) {
     return db
