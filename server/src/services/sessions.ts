@@ -609,10 +609,80 @@ function actorsEqual(a: PaperclipSessionActor, b: PaperclipSessionActor) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function assertSessionIssueScope(issue: SessionIssueRow | null, companyId: string) {
   if (!issue) throw notFound("Session issue not found");
   if (issue.companyId !== companyId) {
     throw forbidden("Session issue belongs to a different company");
+  }
+}
+
+function normalizeReplayParticipants(
+  requested: PaperclipSessionDocument,
+  recorded: PaperclipSessionDocument,
+) {
+  const next = cloneSessionDocument(requested);
+  next.participants = next.participants.map((participant, index) => {
+    const recordedParticipant = recorded.participants[index];
+    if (!recordedParticipant) return participant;
+    if (participant.issueId && participant.issueId !== recordedParticipant.issueId) {
+      throw conflict("Session idempotent replay participant issue does not match recorded transition", {
+        role: participant.role,
+      });
+    }
+    return {
+      ...participant,
+      issueId: recordedParticipant.issueId ?? participant.issueId ?? null,
+    };
+  });
+  return next;
+}
+
+function assertIdempotentReplayMatchesRecorded(
+  input: PaperclipSessionTransitionRequest,
+  recorded: PaperclipSessionDocument,
+) {
+  if (input.idempotencyKey !== recorded.idempotencyKey) {
+    throw conflict("Session idempotent replay key does not match recorded transition");
+  }
+  if (input.transition !== recorded.lastTransition.transition) {
+    throw conflict("Session idempotent replay transition does not match recorded transition");
+  }
+  if (!actorsEqual(input.actor, recorded.lastTransition.actor)) {
+    throw conflict("Session idempotent replay actor does not match recorded transition");
+  }
+  if (input.nextState.lastTransition.transition !== recorded.lastTransition.transition) {
+    throw conflict("Session idempotent replay next state transition does not match recorded transition");
+  }
+  if (!actorsEqual(input.nextState.lastTransition.actor, recorded.lastTransition.actor)) {
+    throw conflict("Session idempotent replay next state actor does not match recorded transition");
+  }
+  const requested = normalizeReplayParticipants(input.nextState, recorded);
+  if (canonicalJson(requested) !== canonicalJson(recorded)) {
+    throw conflict("Session idempotent replay next state does not match recorded transition");
+  }
+}
+
+function assertSessionSourceImmutable(
+  current: PaperclipSessionDocument | null,
+  next: PaperclipSessionDocument,
+) {
+  if (!current) return;
+  if (canonicalJson(current.source) !== canonicalJson(next.source)) {
+    throw conflict("Session source cannot change after creation");
   }
 }
 
@@ -677,8 +747,49 @@ function assertAllowedTransition(
   }
 }
 
-function assertDecisionQuality(state: PaperclipSessionDocument) {
+const MAX_DECISION_SOURCE_FRESHNESS_SECONDS = 24 * 60 * 60;
+const MAX_DECISION_SOURCE_FUTURE_SKEW_SECONDS = 5 * 60;
+
+function decisionSourceFreshnessSeconds(state: PaperclipSessionDocument, observedAt: Date) {
+  if (!state.source.collectedAt) return null;
+  const collectedAtMs = Date.parse(state.source.collectedAt);
+  const observedAtMs = observedAt.getTime();
+  if (!Number.isFinite(collectedAtMs) || !Number.isFinite(observedAtMs)) return null;
+  return Math.floor((observedAtMs - collectedAtMs) / 1000);
+}
+
+function assertDecisionSourceFreshness(state: PaperclipSessionDocument, observedAt: Date) {
+  const reportedFreshnessSeconds = state.source.freshnessSeconds;
+  if (
+    typeof reportedFreshnessSeconds === "number" &&
+    reportedFreshnessSeconds > MAX_DECISION_SOURCE_FRESHNESS_SECONDS
+  ) {
+    throw unprocessable("Session decision source evidence is stale", {
+      freshnessSeconds: reportedFreshnessSeconds,
+      maxFreshnessSeconds: MAX_DECISION_SOURCE_FRESHNESS_SECONDS,
+    });
+  }
+  const freshnessSeconds = decisionSourceFreshnessSeconds(state, observedAt);
+  if (freshnessSeconds === null) {
+    throw unprocessable("Session decision source evidence requires collectedAt");
+  }
+  if (freshnessSeconds < -MAX_DECISION_SOURCE_FUTURE_SKEW_SECONDS) {
+    throw unprocessable("Session decision source evidence cannot be collected in the future", {
+      freshnessSeconds,
+      maxFutureSkewSeconds: MAX_DECISION_SOURCE_FUTURE_SKEW_SECONDS,
+    });
+  }
+  if (freshnessSeconds > MAX_DECISION_SOURCE_FRESHNESS_SECONDS) {
+    throw unprocessable("Session decision source evidence is stale", {
+      freshnessSeconds,
+      maxFreshnessSeconds: MAX_DECISION_SOURCE_FRESHNESS_SECONDS,
+    });
+  }
+}
+
+function assertDecisionQuality(state: PaperclipSessionDocument, observedAt: Date = new Date()) {
   if (state.sessionType === "review" && ["accepted", "rejected", "redirected", "completed"].includes(state.state)) {
+    assertDecisionSourceFreshness(state, observedAt);
     const review = state.reviews[0];
     if (!review) throw unprocessable("Review sessions require a review record before decision");
     const hasChallenge = typeof review.challenge === "string" && review.challenge.trim().length > 0;
@@ -695,6 +806,10 @@ function assertDecisionQuality(state: PaperclipSessionDocument) {
   }
 
   if (state.sessionType === "eod" && ["reviewing", "accepted", "completed"].includes(state.state)) {
+    assertDecisionSourceFreshness(state, observedAt);
+    if (state.eodFindings.length === 0) {
+      throw unprocessable("EOD review requires at least one material finding disposition");
+    }
     const seen = new Set<string>();
     for (const finding of state.eodFindings) {
       if (seen.has(finding.findingId)) {
@@ -708,6 +823,11 @@ function assertDecisionQuality(state: PaperclipSessionDocument) {
       }
       if (["accepted_risk", "no_op"].includes(finding.disposition) && !finding.reason.trim()) {
         throw unprocessable("EOD accepted-risk/no-op disposition requires a reason", {
+          findingId: finding.findingId,
+        });
+      }
+      if (["accepted", "completed"].includes(state.state) && finding.disposition === "task" && !finding.taskRouteId) {
+        throw unprocessable("EOD task disposition requires an owner-bound task route", {
           findingId: finding.findingId,
         });
       }
@@ -999,11 +1119,13 @@ export function sessionService(db: Db) {
     assertSessionIssueScope(issue, input.nextState.companyId);
     const current = await adapter.read(input.issueId);
     if (current && current.state.idempotencyKey === input.idempotencyKey) {
+      assertIdempotentReplayMatchesRecorded(input, current.state);
       return { replayed: true, ...(await inspect({ issueId: input.issueId })) };
     }
+    assertSessionSourceImmutable(current?.state ?? null, input.nextState);
     assertTransitionRequestMatchesNextState(input, current?.state ?? null);
     assertAllowedTransition(current?.state.state ?? null, input.transition, input.nextState.state);
-    assertDecisionQuality(input.nextState);
+    assertDecisionQuality(input.nextState, new Date());
     const nextState = await ensureParticipantObligations(issue!, input.nextState, {
       agentId: input.actor.agentId ?? null,
       userId: input.actor.userId ?? null,
@@ -1128,12 +1250,14 @@ export function sessionService(db: Db) {
     companyId: string;
     policyKey: string;
     sessionType: string;
+    actorAgentId?: string | null;
   }): Promise<{ ok: true } | { ok: false; reason: string }> {
     if (!input.serviceRunId) return { ok: false, reason: "service_run_missing" };
     const run = await db
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
@@ -1142,6 +1266,9 @@ export function sessionService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!run) return { ok: false, reason: "service_run_not_found" };
     if (run.companyId !== input.companyId) return { ok: false, reason: "service_run_company_mismatch" };
+    if (input.actorAgentId && run.agentId !== input.actorAgentId) {
+      return { ok: false, reason: "service_run_agent_mismatch" };
+    }
     if (["failed", "cancelled", "timed_out"].includes(run.status)) return { ok: false, reason: "service_run_not_active" };
     const snapshot = asRecord(run.contextSnapshot);
     const policyKey = typeof snapshot.policyKey === "string" ? snapshot.policyKey : null;
@@ -1175,6 +1302,15 @@ export function sessionService(db: Db) {
     if (!input.trusted) throw notFound("Session not found");
     const next = cloneSessionDocument(input.trusted.state);
     next.taskRoutes = [...next.taskRoutes, input.route];
+    if (input.route.authorityPath !== "failed_router" && input.route.createdIssueId) {
+      next.eodFindings = next.eodFindings.map((finding) =>
+        finding.findingId === input.route.sourceFindingId &&
+        finding.ownerRole === input.route.targetRole &&
+        finding.disposition === "task"
+          ? { ...finding, taskRouteId: input.route.routeId }
+          : finding,
+      );
+    }
     next.stateRevision += 1;
     next.idempotencyKey = `session-task-route:${input.route.routeId}`;
     next.lastTransition = buildLastTransition({ current: input.trusted.state, transition: "route_task", actor: input.actor });
@@ -1193,6 +1329,12 @@ export function sessionService(db: Db) {
 
   async function routeTask(input: PaperclipSessionTaskRouteRequest) {
     assertTaskRouteBoundary(input);
+    if (input.actor.actorType === "service" && !input.serviceRunId) {
+      throw forbidden("Session service task route requires serviceRunId");
+    }
+    if (input.actor.actorType === "service" && !input.actor.agentId) {
+      throw forbidden("Session service task route requires actor agentId");
+    }
     if (input.serviceRunId && input.actor.runId !== input.serviceRunId) {
       throw forbidden("Session task route actor run must match serviceRunId");
     }
@@ -1222,8 +1364,12 @@ export function sessionService(db: Db) {
         companyId: trusted.state.companyId,
         policyKey: trusted.state.policyKey,
         sessionType: trusted.state.sessionType,
+        actorAgentId: input.actor.actorType === "service" ? input.actor.agentId : null,
       });
       if (!authority.ok) {
+        if (authority.reason === "service_run_agent_mismatch") {
+          throw forbidden("Session service task route actor must own serviceRunId");
+        }
         blockedReason = authority.reason;
         authorityPath = input.allowDirectFallback && assigneeAgentId ? "direct" : "failed_router";
       }

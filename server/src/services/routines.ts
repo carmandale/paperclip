@@ -1612,6 +1612,7 @@ export function routineService(
         routineRunId: claim.run.id,
         serviceRunId,
         source: input.source,
+        triggerSource: input.source,
         idempotencyKey: input.idempotencyKey ?? null,
         scheduledFor: input.scheduledFor?.toISOString() ?? null,
         missedRunRecovered: input.missedRunRecovered ?? false,

@@ -5,7 +5,9 @@ import { PAPERCLIP_SESSION_SCHEMA_VERSION } from "@paperclipai/shared";
 import { HttpError } from "../errors.ts";
 import {
   createSessionStateAdapter,
+  evaluateCarSessionAdHocTrigger,
   evaluateSessionStateModelReadiness,
+  listCarSessionAdHocTriggerFramework,
   parseSessionDocumentBody,
   parseSessionTransitionReceiptBody,
   sessionTransitionReceiptDocumentKey,
@@ -295,5 +297,52 @@ describe("session document contract", () => {
       decision: "pivot_to_ledger",
       blockers: ["health", "redacted_receipt_lookup", "eod_backlog_enrollment"],
     });
+  });
+
+  it("defines every R5 ad hoc trigger class with classifier proof hooks", () => {
+    const expectedTriggerClasses = [
+      "standup_nonresponse",
+      "repeated_unanswered_directive",
+      "full_paper_work_halt",
+      "generator_nonproductive_state",
+      "failed_or_stalled_review",
+      "runtime_risk",
+      "material_super_pass_event",
+      "eod_material_finding",
+      "permission_or_task_router_blocker",
+    ];
+    const framework = listCarSessionAdHocTriggerFramework();
+
+    expect(framework.map((entry) => entry.triggerClass)).toEqual(expectedTriggerClasses);
+    for (const spec of framework) {
+      expect(spec.source).toBeTruthy();
+      expect(spec.detector).toBeTruthy();
+      expect(spec.dedupeKeyFields.length).toBeGreaterThan(0);
+      expect(spec.severityInputs.length).toBeGreaterThan(0);
+      expect(spec.capRule).toBeTruthy();
+      expect(spec.overloadRule).toBeTruthy();
+      expect(spec.correctionRule).toBeTruthy();
+      expect(spec.reopenRule).toBeTruthy();
+      expect(spec.noOpRule).toBeTruthy();
+      expect(spec.ownerRole).toBeTruthy();
+
+      const evaluated = evaluateCarSessionAdHocTrigger({
+        triggerClass: spec.triggerClass,
+        severityInputs: { severityScore: 0 },
+        dedupeKey: `${spec.triggerClass}:test`,
+        openSessionCount: 3,
+        openTaskCount: 12,
+        sessionCap: 3,
+        taskCap: 12,
+      });
+      expect(evaluated.producer).toBe(spec.source);
+      expect(evaluated.detector).toBe(spec.detector);
+      expect(evaluated.capDecision).toBe("at_session_cap");
+      expect(evaluated.overloadDecision).toBe(spec.overloadRule);
+      expect(evaluated.noOpReason).toBe(spec.noOpRule);
+      expect(evaluated.correctionTarget).toBe(spec.correctionRule);
+      expect(evaluated.reopenTarget).toBe(spec.reopenRule);
+      expect(evaluated.ownerRole).toBe(spec.ownerRole);
+    }
   });
 });

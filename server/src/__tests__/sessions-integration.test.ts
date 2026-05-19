@@ -46,6 +46,7 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("Paperclip session service integration", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const freshSourceCollectedAt = new Date().toISOString();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-sessions-integration-");
@@ -160,8 +161,10 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
     state?: PaperclipSessionDocument["state"];
     stateRevision?: number;
     beforeState?: PaperclipSessionDocument["state"] | null;
+    source?: PaperclipSessionDocument["source"];
   }): PaperclipSessionDocument {
     const state = input.state ?? "open";
+    const now = freshSourceCollectedAt;
     return {
       schemaVersion: PAPERCLIP_SESSION_SCHEMA_VERSION,
       policyKey: "car-leadership-sessions",
@@ -176,8 +179,9 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       source: {
         triggerClass: "eod_material_finding",
         source: "test",
-        collectedAt: "2026-05-18T19:00:00.000Z",
+        collectedAt: now,
         snapshot: { issueIdentifier: "CAR-1095" },
+        ...input.source,
       },
       participants: [
         {
@@ -198,12 +202,15 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
         actor: input.actor,
         beforeState: input.beforeState ?? null,
         afterState: state,
-        at: "2026-05-18T19:00:00.000Z",
+        at: now,
       },
     };
   }
 
-  async function createOpenSession(fixture: Awaited<ReturnType<typeof seedFixture>>) {
+  async function createOpenSession(
+    fixture: Awaited<ReturnType<typeof seedFixture>>,
+    overrides: Pick<Parameters<typeof makeSession>[0], "source"> = {},
+  ) {
     const actor = boardActor();
     const svc = sessionService(db);
     return svc.transition({
@@ -216,6 +223,7 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
         issueId: fixture.sessionIssue.id,
         participantAgentId: fixture.participantAgentId,
         actor,
+        ...overrides,
       }),
       actor,
       idempotencyKey: `session:${fixture.sessionIssue.id}:0`,
@@ -277,6 +285,43 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
     expect(obligation?.parentId).toBe(fixture.sessionIssue.id);
   });
 
+  it("replays idempotent session transitions without writing a new revision", async () => {
+    const fixture = await seedFixture();
+    const actor = boardActor();
+    const svc = sessionService(db);
+    const input = {
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: null,
+      expectedState: null,
+      transition: "create" as const,
+      nextState: makeSession({
+        companyId: fixture.companyId,
+        issueId: fixture.sessionIssue.id,
+        participantAgentId: fixture.participantAgentId,
+        actor,
+      }),
+      actor,
+      idempotencyKey: `session:${fixture.sessionIssue.id}:0`,
+    };
+
+    const created = await svc.transition(input);
+    const replayed = await svc.transition(input);
+
+    expect(replayed.replayed).toBe(true);
+    expect(replayed.document.latestRevisionId).toBe(created.document.latestRevisionId);
+    expect(replayed.session.stateRevision).toBe(created.session.stateRevision);
+
+    await expect(svc.transition({
+      ...input,
+      actor: { ...actor, actorId: "other-board", userId: "other-board" },
+    })).rejects.toMatchObject({ status: 409 });
+
+    await expect(svc.transition({
+      ...input,
+      nextState: { ...input.nextState, objective: "Forge a different objective under the same idempotency key." },
+    })).rejects.toMatchObject({ status: 409 });
+  });
+
   it("updates participant response state through the server-owned session document", async () => {
     const fixture = await seedFixture();
     const created = await createOpenSession(fixture);
@@ -328,6 +373,209 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       idempotencyKey: "passive-review",
     })).rejects.toMatchObject({ status: 422 });
 
+    const sourceRefresh = makeSession({
+      companyId: fixture.companyId,
+      issueId: fixture.sessionIssue.id,
+      participantAgentId: fixture.participantAgentId,
+      actor,
+      state: "reviewing",
+      stateRevision: 1,
+      beforeState: "open",
+    });
+    sourceRefresh.idempotencyKey = "source-refresh";
+    sourceRefresh.source = { ...created.session.source, freshnessSeconds: 0 };
+    sourceRefresh.eodFindings = [{
+      findingId: "CAR-1095",
+      summary: "Try to refresh source freshness during the decision transition.",
+      disposition: "task",
+      ownerRole: "CRO",
+      reason: "source freshness cannot be rewritten by the decision request",
+    }];
+
+    await expect(sessionService(db).transition({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: created.document.latestRevisionId,
+      expectedState: "open",
+      transition: "challenge",
+      nextState: sourceRefresh,
+      actor,
+      idempotencyKey: "source-refresh",
+    })).rejects.toMatchObject({ status: 409 });
+
+    const staleFixture = await seedFixture();
+    const staleCreated = await createOpenSession(staleFixture, { source: { freshnessSeconds: 172_800 } });
+    const staleReview = makeSession({
+      companyId: staleFixture.companyId,
+      issueId: staleFixture.sessionIssue.id,
+      participantAgentId: staleFixture.participantAgentId,
+      actor,
+      sessionType: "review",
+      state: "accepted",
+      stateRevision: 1,
+      beforeState: "open",
+      source: staleCreated.session.source,
+    });
+    staleReview.idempotencyKey = "stale-review";
+    staleReview.lastTransition.transition = "accept";
+    staleReview.reviews = [{
+      domain: "research",
+      challenge: "Qualified challenge exists, but the source freshness is stale.",
+      disposition: "accepted",
+      downstreamOwnerRole: "CRO",
+    }];
+
+    await expect(sessionService(db).transition({
+      issueId: staleFixture.sessionIssue.id,
+      expectedRevisionId: staleCreated.document.latestRevisionId,
+      expectedState: "open",
+      transition: "accept",
+      nextState: staleReview,
+      actor,
+      idempotencyKey: "stale-review",
+    })).rejects.toMatchObject({ status: 422 });
+
+    const staleCollectedAt = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const staleCollectedAtFixture = await seedFixture();
+    const staleCollectedAtCreated = await createOpenSession(staleCollectedAtFixture, {
+      source: { collectedAt: staleCollectedAt, freshnessSeconds: 0 },
+    });
+    const staleCollectedAtReview = makeSession({
+      companyId: staleCollectedAtFixture.companyId,
+      issueId: staleCollectedAtFixture.sessionIssue.id,
+      participantAgentId: staleCollectedAtFixture.participantAgentId,
+      actor,
+      sessionType: "review",
+      state: "accepted",
+      stateRevision: 1,
+      beforeState: "open",
+      source: staleCollectedAtCreated.session.source,
+    });
+    staleCollectedAtReview.idempotencyKey = "stale-collected-at-review";
+    staleCollectedAtReview.lastTransition.transition = "accept";
+    staleCollectedAtReview.reviews = [{
+      domain: "research",
+      challenge: "Qualified challenge exists, but collectedAt proves the source is stale.",
+      disposition: "accepted",
+      downstreamOwnerRole: "CRO",
+    }];
+
+    await expect(sessionService(db).transition({
+      issueId: staleCollectedAtFixture.sessionIssue.id,
+      expectedRevisionId: staleCollectedAtCreated.document.latestRevisionId,
+      expectedState: "open",
+      transition: "accept",
+      nextState: staleCollectedAtReview,
+      actor,
+      idempotencyKey: "stale-collected-at-review",
+    })).rejects.toMatchObject({ status: 422 });
+
+    const missingReviewOwner = makeSession({
+      companyId: fixture.companyId,
+      issueId: fixture.sessionIssue.id,
+      participantAgentId: fixture.participantAgentId,
+      actor,
+      sessionType: "review",
+      state: "accepted",
+      stateRevision: 1,
+      beforeState: "open",
+    });
+    missingReviewOwner.idempotencyKey = "missing-review-owner";
+    missingReviewOwner.lastTransition.transition = "accept";
+    missingReviewOwner.reviews = [{
+      domain: "research",
+      challenge: "Qualified challenge exists, but no one owns the accepted result.",
+      disposition: "accepted",
+    }];
+
+    await expect(sessionService(db).transition({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: created.document.latestRevisionId,
+      expectedState: "open",
+      transition: "accept",
+      nextState: missingReviewOwner,
+      actor,
+      idempotencyKey: "missing-review-owner",
+    })).rejects.toMatchObject({ status: 422 });
+
+    const summaryOnlyEod = makeSession({
+      companyId: fixture.companyId,
+      issueId: fixture.sessionIssue.id,
+      participantAgentId: fixture.participantAgentId,
+      actor,
+      state: "accepted",
+      stateRevision: 1,
+      beforeState: "open",
+    });
+    summaryOnlyEod.idempotencyKey = "summary-only-eod";
+    summaryOnlyEod.lastTransition.transition = "accept";
+
+    await expect(sessionService(db).transition({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: created.document.latestRevisionId,
+      expectedState: "open",
+      transition: "accept",
+      nextState: summaryOnlyEod,
+      actor,
+      idempotencyKey: "summary-only-eod",
+    })).rejects.toMatchObject({ status: 422 });
+
+    const acceptedRiskWithoutReason = makeSession({
+      companyId: fixture.companyId,
+      issueId: fixture.sessionIssue.id,
+      participantAgentId: fixture.participantAgentId,
+      actor,
+      state: "accepted",
+      stateRevision: 1,
+      beforeState: "open",
+    });
+    acceptedRiskWithoutReason.idempotencyKey = "accepted-risk-no-reason";
+    acceptedRiskWithoutReason.lastTransition.transition = "accept";
+    acceptedRiskWithoutReason.eodFindings = [{
+      findingId: "CAR-1096",
+      summary: "Known risk was accepted without an explanation.",
+      disposition: "accepted_risk",
+      reason: "",
+    }];
+
+    await expect(sessionService(db).transition({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: created.document.latestRevisionId,
+      expectedState: "open",
+      transition: "accept",
+      nextState: acceptedRiskWithoutReason,
+      actor,
+      idempotencyKey: "accepted-risk-no-reason",
+    })).rejects.toMatchObject({ status: 422 });
+
+    const missingOwnerAction = makeSession({
+      companyId: fixture.companyId,
+      issueId: fixture.sessionIssue.id,
+      participantAgentId: fixture.participantAgentId,
+      actor,
+      state: "accepted",
+      stateRevision: 1,
+      beforeState: "open",
+    });
+    missingOwnerAction.idempotencyKey = "missing-owner-action";
+    missingOwnerAction.lastTransition.transition = "accept";
+    missingOwnerAction.eodFindings = [{
+      findingId: "CAR-1097",
+      summary: "Material paper work needs a task.",
+      disposition: "task",
+      ownerRole: "CRO",
+      reason: "Material finding needs owner-bound action.",
+    }];
+
+    await expect(sessionService(db).transition({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: created.document.latestRevisionId,
+      expectedState: "open",
+      transition: "accept",
+      nextState: missingOwnerAction,
+      actor,
+      idempotencyKey: "missing-owner-action",
+    })).rejects.toMatchObject({ status: 422 });
+
     const duplicateEod = makeSession({
       companyId: fixture.companyId,
       issueId: fixture.sessionIssue.id,
@@ -376,6 +624,7 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       },
     }, {});
     const validServiceRunId = randomUUID();
+    const timedOutServiceRunId = randomUUID();
     const revokedServiceRunId = randomUUID();
     await db.insert(heartbeatRuns).values([
       {
@@ -388,6 +637,17 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
           policyKey: "car-leadership-sessions",
           allowedSessionTypes: ["eod"],
           routerRevoked: false,
+        },
+      },
+      {
+        id: timedOutServiceRunId,
+        companyId: fixture.companyId,
+        agentId: fixture.managerAgentId,
+        invocationSource: "routine_session",
+        status: "timed_out",
+        contextSnapshot: {
+          policyKey: "car-leadership-sessions",
+          allowedSessionTypes: ["eod"],
         },
       },
       {
@@ -404,7 +664,7 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       },
     ]);
 
-    const routed = await sessionService(db).routeTask({
+    const direct = await sessionService(db).routeTask({
       issueId: fixture.sessionIssue.id,
       expectedRevisionId: withFinding.document.latestRevisionId!,
       sourceFindingId: "CAR-1095",
@@ -414,11 +674,57 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       description: "Create the next paper-work action for CAR-1095.",
       priority: "high",
       assigneeAgentId: fixture.participantAgentId,
+      actor: boardActor(),
+    });
+    expect(direct.route.authorityPath).toBe("direct");
+    expect(direct.route.createdIssueId).toBeTruthy();
+    expect(
+      direct.session.eodFindings.find((finding) => finding.findingId === "CAR-1095")?.taskRouteId,
+    ).toBe(direct.route.routeId);
+
+    const fallback = await sessionService(db).routeTask({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: direct.document.latestRevisionId!,
+      sourceFindingId: "CAR-1095",
+      intendedOwnerRole: "CRO",
+      targetRole: "CRO",
+      title: "Investigate CAR-1095 through fallback",
+      description: "Create the next paper-work action through the participant role fallback.",
+      priority: "high",
+      actor: boardActor(),
+    });
+    expect(fallback.route.authorityPath).toBe("multi_actor_fallback");
+    expect(fallback.route.createdIssueId).toBeTruthy();
+
+    const routed = await sessionService(db).routeTask({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: fallback.document.latestRevisionId!,
+      sourceFindingId: "CAR-1095",
+      intendedOwnerRole: "CRO",
+      targetRole: "CRO",
+      title: "Investigate CAR-1095 through service",
+      description: "Create the next paper-work action for CAR-1095 through service authority.",
+      priority: "high",
+      assigneeAgentId: fixture.participantAgentId,
       serviceRunId: validServiceRunId,
       actor: serviceActor(fixture.managerAgentId, validServiceRunId),
     });
     expect(routed.route.authorityPath).toBe("service");
     expect(routed.route.createdIssueId).toBeTruthy();
+
+    await expect(sessionService(db).routeTask({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: routed.document.latestRevisionId!,
+      sourceFindingId: "CAR-1095",
+      intendedOwnerRole: "CRO",
+      targetRole: "CRO",
+      title: "Try service run with wrong actor",
+      description: "Create the next paper-work action with an actor who does not own the service run.",
+      priority: "high",
+      assigneeAgentId: fixture.participantAgentId,
+      serviceRunId: validServiceRunId,
+      actor: serviceActor(fixture.participantAgentId, validServiceRunId),
+    })).rejects.toMatchObject({ status: 403 });
 
     await expect(sessionService(db).routeTask({
       issueId: fixture.sessionIssue.id,
@@ -446,9 +752,76 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       actor: boardActor(),
     })).rejects.toMatchObject({ status: 403 });
 
-    const failed = await sessionService(db).routeTask({
+    await expect(sessionService(db).routeTask({
       issueId: fixture.sessionIssue.id,
       expectedRevisionId: routed.document.latestRevisionId!,
+      sourceFindingId: "CAR-1095",
+      intendedOwnerRole: "CRO",
+      targetRole: "CRO",
+      title: "Service route without a service run",
+      description: "A service actor must not route work without service-run authority.",
+      priority: "high",
+      assigneeAgentId: fixture.participantAgentId,
+      actor: serviceActor(fixture.managerAgentId),
+    })).rejects.toMatchObject({ status: 403 });
+
+    for (const blockedDescription of [
+      "Grant permission to mutate another agent.",
+      "Move live capital after this review.",
+      "Create work in an unrelated project.",
+    ]) {
+      await expect(sessionService(db).routeTask({
+        issueId: fixture.sessionIssue.id,
+        expectedRevisionId: routed.document.latestRevisionId!,
+        sourceFindingId: "CAR-1095",
+        intendedOwnerRole: "CRO",
+        targetRole: "CRO",
+        title: blockedDescription,
+        description: blockedDescription,
+        priority: "high",
+        assigneeAgentId: fixture.participantAgentId,
+        actor: boardActor(),
+      })).rejects.toMatchObject({ status: 403 });
+    }
+
+    const unavailableRunId = randomUUID();
+    const unavailable = await sessionService(db).routeTask({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: routed.document.latestRevisionId!,
+      sourceFindingId: "CAR-1095",
+      intendedOwnerRole: "CRO",
+      targetRole: "CRO",
+      title: "Investigate missing-router case",
+      description: "Create the next paper-work action after router lookup fails.",
+      priority: "high",
+      assigneeAgentId: fixture.participantAgentId,
+      serviceRunId: unavailableRunId,
+      actor: serviceActor(fixture.managerAgentId, unavailableRunId),
+    });
+    expect(unavailable.route.authorityPath).toBe("failed_router");
+    expect(unavailable.route.blockedReason).toBe("service_run_not_found");
+    expect(unavailable.route.createdIssueId).toBeNull();
+
+    const stale = await sessionService(db).routeTask({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: unavailable.document.latestRevisionId!,
+      sourceFindingId: "CAR-1095",
+      intendedOwnerRole: "CRO",
+      targetRole: "CRO",
+      title: "Investigate timed-out-router case",
+      description: "Create the next paper-work action after router authority timed out.",
+      priority: "high",
+      assigneeAgentId: fixture.participantAgentId,
+      serviceRunId: timedOutServiceRunId,
+      actor: serviceActor(fixture.managerAgentId, timedOutServiceRunId),
+    });
+    expect(stale.route.authorityPath).toBe("failed_router");
+    expect(stale.route.blockedReason).toBe("service_run_not_active");
+    expect(stale.route.createdIssueId).toBeNull();
+
+    const failed = await sessionService(db).routeTask({
+      issueId: fixture.sessionIssue.id,
+      expectedRevisionId: stale.document.latestRevisionId!,
       sourceFindingId: "CAR-1095",
       intendedOwnerRole: "CRO",
       targetRole: "CRO",
@@ -490,6 +863,16 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
     expect(afterRollback.route.authorityPath).toBe("failed_router");
     expect(afterRollback.route.createdIssueId).toBeNull();
     expect(afterRollback.route.blockedReason).toBe("service_run_router_revoked");
+    const inspected = await sessionService(db).inspect({ issueId: fixture.sessionIssue.id });
+    expect(inspected.taskRoutes.map((route) => route.routeId)).toEqual(expect.arrayContaining([
+      direct.route.routeId,
+      fallback.route.routeId,
+      routed.route.routeId,
+      unavailable.route.routeId,
+      stale.route.routeId,
+      failed.route.routeId,
+      afterRollback.route.routeId,
+    ]));
   });
 
   it("keeps linked session routines on the session path and preserves normal routine dispatch", async () => {
@@ -530,6 +913,45 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
     const inspection = await sessionService(db).inspect({ issueId: linkedRun.linkedIssueId! });
     expect(inspection.session.policyKey).toBe("car-leadership-sessions");
     expect(inspection.participantIssues).toHaveLength(1);
+
+    const scheduledLinked = await svc.create(fixture.companyId, {
+      projectId: fixture.projectId,
+      title: "CAR linked scheduled EOD",
+      assigneeAgentId: fixture.managerAgentId,
+      linkedSessionPolicy: {
+        policyKey: "car-leadership-sessions",
+        policyVersion: "2026-05-18",
+        sessionType: "eod",
+        objective: "Turn the scheduled day review into owner-bound work.",
+        participants: [{ role: "CRO", agentId: fixture.participantAgentId }],
+      },
+    }, {});
+    const { trigger } = await svc.createTrigger(scheduledLinked.id, {
+      kind: "schedule",
+      label: "EOD",
+      cronExpression: "0 22 * * 1-5",
+      timezone: "America/Chicago",
+    }, {});
+    const scheduledFor = new Date("2026-05-18T22:00:00.000Z");
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: scheduledFor })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    const ticked = await svc.tickScheduledTriggers(new Date("2026-05-18T22:05:00.000Z"));
+
+    expect(ticked.triggered).toBe(1);
+    const [scheduledRun] = await svc.listRuns(scheduledLinked.id);
+    expect(scheduledRun?.source).toBe("schedule");
+    expect(scheduledRun?.status).toBe("issue_created");
+    const scheduledInspection = await sessionService(db).inspect({ issueId: scheduledRun!.linkedIssueId! });
+    expect(scheduledInspection.session.source.source).toBe("paperclip-routine");
+    expect(scheduledInspection.session.source.snapshot).toMatchObject({
+      routineId: scheduledLinked.id,
+      routineRunId: scheduledRun?.id,
+      triggerId: trigger.id,
+      triggerSource: "schedule",
+    });
   });
 
   it("provides redacted receipt, rollback-disable, and full R5 trigger framework proof", async () => {

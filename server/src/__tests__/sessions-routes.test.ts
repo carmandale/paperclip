@@ -96,6 +96,21 @@ function transitionBody(actor = boardActor) {
   };
 }
 
+function taskRouteBody(actor = boardActor) {
+  return {
+    issueId,
+    expectedRevisionId: "66666666-6666-4666-8666-666666666666",
+    sourceFindingId: "CAR-1095",
+    intendedOwnerRole: "CRO",
+    targetRole: "CRO",
+    title: "Investigate CAR-1095",
+    description: "Create the next paper-work action for CAR-1095.",
+    priority: "high",
+    assigneeAgentId: participantAgentId,
+    actor,
+  };
+}
+
 describe("session routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -190,5 +205,64 @@ describe("session routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockSessionService.respond).not.toHaveBeenCalled();
+  });
+
+  it("requires a matching board actor and tasks:assign for task routing", async () => {
+    const mismatchedActorApp = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const mismatch = await request(mismatchedActorApp).post("/api/sessions/task-route").send(taskRouteBody());
+
+    expect(mismatch.status).toBe(403);
+    expect(mockSessionService.inspect).not.toHaveBeenCalled();
+    expect(mockSessionService.routeTask).not.toHaveBeenCalled();
+
+    const limitedBoardApp = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const limited = await request(limitedBoardApp).post("/api/sessions/task-route").send(taskRouteBody({
+      ...boardActor,
+      actorId: "board-user",
+      userId: "board-user",
+    }));
+
+    expect(limited.status).toBe(403);
+    expect(limited.body.error).toContain("tasks:assign");
+    expect(mockSessionService.routeTask).not.toHaveBeenCalled();
+  });
+
+  it("requires a matching board actor for receipt redaction", async () => {
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app).post("/api/sessions/receipt-redact").send({
+      issueId,
+      expectedRevisionId: "66666666-6666-4666-8666-666666666666",
+      redaction: {
+        auditId: "audit-car-1095",
+        managerReceipt: { finding: "CAR-1095", secret: "manager-only" },
+        participantReceipt: { finding: "CAR-1095", secret: "[redacted]" },
+        redactedFields: ["secret"],
+      },
+      actor: boardActor,
+    });
+
+    expect(res.status).toBe(403);
+    expect(mockSessionService.redactReceipt).not.toHaveBeenCalled();
   });
 });
