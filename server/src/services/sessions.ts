@@ -1,7 +1,17 @@
+import { randomUUID } from "node:crypto";
+import { and, eq, sql } from "drizzle-orm";
 import type {
+  CarSessionTriggerEvaluationRequest,
+  CarSessionTriggerSpec,
+  PaperclipSessionActor,
   PaperclipSessionDocument,
+  PaperclipSessionReceiptRedactionRequest,
   PaperclipSessionState,
+  PaperclipSessionTaskRouteRequest,
   PaperclipSessionTransitionReceiptDocument,
+  PaperclipSessionTransitionRequest,
+  PaperclipSessionResponseRequest,
+  PaperclipTaskRouteReceipt,
 } from "@paperclipai/shared";
 import {
   PAPERCLIP_SESSION_DOCUMENT_KEY,
@@ -9,9 +19,11 @@ import {
   paperclipSessionDocumentSchema,
   paperclipSessionTransitionReceiptDocumentSchema,
 } from "@paperclipai/shared";
-import { conflict, unprocessable } from "../errors.js";
+import { agents, heartbeatRuns, issues, routines } from "@paperclipai/db";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { documentService } from "./documents.js";
 import type { Db } from "@paperclipai/db";
+import { issueService } from "./issues.js";
 
 type IssueDocumentRow = {
   id: string;
@@ -400,4 +412,778 @@ export function createSessionStateAdapter(documents: IssueDocumentStore) {
 
 export function sessionStateAdapter(db: Db) {
   return createSessionStateAdapter(documentService(db));
+}
+
+type SessionIssueRow = {
+  id: string;
+  companyId: string;
+  projectId: string | null;
+  goalId: string | null;
+  priority: string;
+  assigneeAgentId: string | null;
+  identifier: string | null;
+  title: string;
+};
+
+const SESSION_TERMINAL_STATES = new Set<PaperclipSessionState>(["completed", "cancelled", "rollback_disabled"]);
+
+const CAR_SESSION_TRIGGER_FRAMEWORK: CarSessionTriggerSpec[] = [
+  {
+    triggerClass: "standup_nonresponse",
+    detector: "standup participant due window expires without an authenticated response",
+    source: "standup_sla",
+    severityInputs: ["missed_count", "role_criticality", "minutes_overdue"],
+    dedupeKeyFields: ["policy_key", "local_date", "participant_agent_id"],
+    capRule: "cap open ad hoc sessions per policy sessionCap",
+    overloadRule: "downgrade to owner-bound task when open sessions are at cap",
+    correctionRule: "late response closes or downgrades the trigger",
+    reopenRule: "new missed window after closure reopens by participant/date",
+    noOpRule: "no-op when participant is excused or policy disabled",
+    ownerRole: "OpsManager",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "repeated_unanswered_directive",
+    detector: "same actor directive is unanswered across the configured repeat window",
+    source: "issue_comments_and_mentions",
+    severityInputs: ["repeat_count", "age_minutes", "directive_priority"],
+    dedupeKeyFields: ["directive_thread", "target_role"],
+    capRule: "cap by directive owner and target role",
+    overloadRule: "escalate prioritization receipt instead of opening another meeting",
+    correctionRule: "answered directive resolves pending trigger",
+    reopenRule: "new unanswered directive after answer opens a new dedupe key",
+    noOpRule: "no-op when directive is informational or already accepted risk",
+    ownerRole: "COO",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "full_paper_work_halt",
+    detector: "no material paper-work progress is observed inside the numeric progress window",
+    source: "operator_progress_monitor",
+    severityInputs: ["idle_minutes", "open_blockers", "strategy_pipeline_state"],
+    dedupeKeyFields: ["company_id", "halt_window"],
+    capRule: "one full-halt ad hoc session per halt window",
+    overloadRule: "route to CEO review when repeated under cap pressure",
+    correctionRule: "new material progress downgrades trigger",
+    reopenRule: "subsequent halt window reopens",
+    noOpRule: "no-op during approved planned pause",
+    ownerRole: "CEO",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "generator_nonproductive_state",
+    detector: "generator state remains idle, incident, or nonproductive beyond policy window",
+    source: "generator_runtime_state",
+    severityInputs: ["state_age_minutes", "failed_attempts", "candidate_count"],
+    dedupeKeyFields: ["generator_state", "runtime_lane"],
+    capRule: "cap by runtime lane",
+    overloadRule: "create owner-bound recovery task instead of extra ad hoc session",
+    correctionRule: "productive generator state resolves trigger",
+    reopenRule: "regression to nonproductive state reopens",
+    noOpRule: "no-op when disabled by rollback receipt",
+    ownerRole: "CRO",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "failed_or_stalled_review",
+    detector: "review issue has no qualified challenge or no downstream disposition by deadline",
+    source: "session_review_inspect",
+    severityInputs: ["review_age_minutes", "missing_challenge", "missing_disposition"],
+    dedupeKeyFields: ["review_session_issue_id", "domain"],
+    capRule: "one ad hoc session per stalled review",
+    overloadRule: "route failed-router receipt to review owner",
+    correctionRule: "qualified challenge and downstream disposition close the trigger",
+    reopenRule: "redirected review missing owner reopens",
+    noOpRule: "no-op when policy-valid non-applicability reason exists",
+    ownerRole: "CTO",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "runtime_risk",
+    detector: "runtime health or execution errors cross configured severity",
+    source: "paperclip_health_monitor",
+    severityInputs: ["error_count", "affected_agents", "runtime_age_minutes"],
+    dedupeKeyFields: ["runtime_surface", "failure_signature"],
+    capRule: "cap by runtime surface",
+    overloadRule: "open one incident task and append evidence to it",
+    correctionRule: "healthy observation downgrades trigger",
+    reopenRule: "new failure signature reopens",
+    noOpRule: "no-op for stale resolved incidents",
+    ownerRole: "OpsManager",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "material_super_pass_event",
+    detector: "strategy or research event crosses material SUPER-PASS threshold",
+    source: "strategy_evaluator",
+    severityInputs: ["score", "expected_return", "freshness_seconds"],
+    dedupeKeyFields: ["strategy_id", "event_type"],
+    capRule: "cap one ad hoc review per material strategy event",
+    overloadRule: "route to CRO priority queue when cap exceeded",
+    correctionRule: "event downgrade or stale source closes trigger",
+    reopenRule: "fresh material event reopens",
+    noOpRule: "no-op for live-capital authorization requests",
+    ownerRole: "CRO",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "eod_material_finding",
+    detector: "EOD review records a material finding requiring follow-up",
+    source: "session_eod_review",
+    severityInputs: ["finding_priority", "blocked_roles", "age_minutes"],
+    dedupeKeyFields: ["finding_id", "owner_role"],
+    capRule: "cap by EOD session and owner role",
+    overloadRule: "merge into existing owner-bound finding task",
+    correctionRule: "disposition closes trigger",
+    reopenRule: "rejected disposition with new evidence reopens",
+    noOpRule: "no-op only with accepted-risk or no-op reason",
+    ownerRole: "COO",
+    persistentCompletionExpiry: null,
+  },
+  {
+    triggerClass: "permission_or_task_router_blocker",
+    detector: "task router cannot create owner-bound follow-up or permission boundary blocks paper work",
+    source: "session_task_router",
+    severityInputs: ["blocked_route_count", "authority_path", "minutes_blocked"],
+    dedupeKeyFields: ["policy_key", "target_role", "blocked_reason"],
+    capRule: "cap one blocker session per target role",
+    overloadRule: "fall back to manager/audit issue receipt",
+    correctionRule: "direct/service route success closes trigger",
+    reopenRule: "revoked or failed service run reopens",
+    noOpRule: "no-op for live-capital boundary because board approval is required",
+    ownerRole: "CEO",
+    persistentCompletionExpiry: null,
+  },
+];
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function nowIso(now: Date = new Date()) {
+  return now.toISOString();
+}
+
+function cloneSessionDocument(state: PaperclipSessionDocument): PaperclipSessionDocument {
+  return paperclipSessionDocumentSchema.parse(JSON.parse(JSON.stringify(state)));
+}
+
+function actorsEqual(a: PaperclipSessionActor, b: PaperclipSessionActor) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function assertSessionIssueScope(issue: SessionIssueRow | null, companyId: string) {
+  if (!issue) throw notFound("Session issue not found");
+  if (issue.companyId !== companyId) {
+    throw forbidden("Session issue belongs to a different company");
+  }
+}
+
+function assertTransitionRequestMatchesNextState(
+  input: PaperclipSessionTransitionRequest,
+  current: PaperclipSessionDocument | null,
+) {
+  const next = input.nextState;
+  if (next.idempotencyKey !== input.idempotencyKey) {
+    throw unprocessable("Session transition idempotencyKey must match next state");
+  }
+  if (next.lastTransition.transition !== input.transition) {
+    throw unprocessable("Session transition must match next state lastTransition");
+  }
+  if (!actorsEqual(next.lastTransition.actor, input.actor)) {
+    throw unprocessable("Session actor must match next state lastTransition actor");
+  }
+  const expectedBefore = current?.state ?? null;
+  if (next.lastTransition.beforeState !== expectedBefore) {
+    throw conflict("Session transition beforeState does not match current state", {
+      currentState: expectedBefore,
+    });
+  }
+  const expectedRevision = current ? current.stateRevision + 1 : 0;
+  if (next.stateRevision !== expectedRevision) {
+    throw conflict("Session stateRevision must advance by one", {
+      expectedRevision,
+      actualRevision: next.stateRevision,
+    });
+  }
+}
+
+function assertAllowedTransition(
+  before: PaperclipSessionState | null,
+  transition: PaperclipSessionDocument["lastTransition"]["transition"],
+  after: PaperclipSessionState,
+) {
+  if (before && SESSION_TERMINAL_STATES.has(before) && transition !== "rollback_disable") {
+    throw conflict("Terminal sessions cannot transition except rollback_disable", { before, transition });
+  }
+  const ok =
+    (transition === "create" && before == null && ["draft", "open", "waiting_response"].includes(after)) ||
+    (transition === "open" && before === "draft" && after === "open") ||
+    (transition === "request_response" && ["open", "draft"].includes(before ?? "") && after === "waiting_response") ||
+    (transition === "respond" && ["open", "waiting_response"].includes(before ?? "") && ["waiting_response", "reviewing"].includes(after)) ||
+    (transition === "mark_missed" && ["open", "waiting_response"].includes(before ?? "") && ["waiting_response", "blocked", "reviewing"].includes(after)) ||
+    (transition === "challenge" && ["open", "waiting_response", "reviewing"].includes(before ?? "") && after === "reviewing") ||
+    (["accept", "reject", "redirect"].includes(transition) && ["open", "waiting_response", "reviewing"].includes(before ?? "") &&
+      ((transition === "accept" && after === "accepted") ||
+        (transition === "reject" && after === "rejected") ||
+        (transition === "redirect" && after === "redirected"))) ||
+    (transition === "dispose_finding" && ["open", "waiting_response", "reviewing"].includes(before ?? "") && ["open", "reviewing"].includes(after)) ||
+    (transition === "route_task" && before != null && after === before) ||
+    (transition === "redact_receipt" && before != null && after === before) ||
+    (transition === "reopen" && ["blocked", "rejected", "redirected", "cancelled"].includes(before ?? "") && after === "open") ||
+    (transition === "complete" && ["open", "reviewing", "accepted", "rejected", "redirected"].includes(before ?? "") && after === "completed") ||
+    (transition === "block" && before != null && after === "blocked") ||
+    (transition === "rollback_disable" && after === "rollback_disabled") ||
+    (transition === "cancel" && before != null && after === "cancelled");
+  if (!ok) {
+    throw conflict("Session transition is not allowed", { before, transition, after });
+  }
+}
+
+function assertDecisionQuality(state: PaperclipSessionDocument) {
+  if (state.sessionType === "review" && ["accepted", "rejected", "redirected", "completed"].includes(state.state)) {
+    const review = state.reviews[0];
+    if (!review) throw unprocessable("Review sessions require a review record before decision");
+    const hasChallenge = typeof review.challenge === "string" && review.challenge.trim().length > 0;
+    const hasNonApplicability =
+      review.disposition === "not_applicable" &&
+      typeof review.dispositionReason === "string" &&
+      review.dispositionReason.trim().length > 0;
+    if (!hasChallenge && !hasNonApplicability) {
+      throw unprocessable("Review decision requires a qualified challenge or policy-valid non-applicability reason");
+    }
+    if (["accepted", "rejected", "redirected"].includes(state.state) && !review.downstreamOwnerRole) {
+      throw unprocessable("Review decision requires a downstream owner role");
+    }
+  }
+
+  if (state.sessionType === "eod" && ["reviewing", "accepted", "completed"].includes(state.state)) {
+    const seen = new Set<string>();
+    for (const finding of state.eodFindings) {
+      if (seen.has(finding.findingId)) {
+        throw unprocessable("EOD finding must have exactly one disposition", { findingId: finding.findingId });
+      }
+      seen.add(finding.findingId);
+      if (["task", "ad_hoc_meeting", "system_change"].includes(finding.disposition) && !finding.ownerRole) {
+        throw unprocessable("EOD material finding disposition requires an owner role", {
+          findingId: finding.findingId,
+        });
+      }
+      if (["accepted_risk", "no_op"].includes(finding.disposition) && !finding.reason.trim()) {
+        throw unprocessable("EOD accepted-risk/no-op disposition requires a reason", {
+          findingId: finding.findingId,
+        });
+      }
+    }
+  }
+}
+
+function assertTaskRouteBoundary(input: PaperclipSessionTaskRouteRequest) {
+  const searchable = `${input.title}\n${input.description}`.toLowerCase();
+  const blocked = [
+    ["live capital", "live-capital authority is outside session task routing"],
+    ["real money", "real-money authority is outside session task routing"],
+    ["permission grant", "permission mutation is outside session task routing"],
+    ["grant permission", "permission mutation is outside session task routing"],
+    ["instance admin", "permission mutation is outside session task routing"],
+    ["unrelated project", "unrelated project mutation is outside session task routing"],
+  ].find(([needle]) => searchable.includes(needle));
+  if (blocked) throw forbidden(blocked[1]);
+}
+
+function buildLastTransition(input: {
+  current: PaperclipSessionDocument;
+  transition: PaperclipSessionDocument["lastTransition"]["transition"];
+  actor: PaperclipSessionActor;
+  now?: Date;
+}) {
+  return {
+    transitionId: randomUUID(),
+    transition: input.transition,
+    actor: input.actor,
+    beforeState: input.current.state,
+    afterState: input.current.state,
+    at: nowIso(input.now),
+  };
+}
+
+export function evaluateCarSessionAdHocTrigger(input: CarSessionTriggerEvaluationRequest) {
+  const spec = CAR_SESSION_TRIGGER_FRAMEWORK.find((candidate) => candidate.triggerClass === input.triggerClass);
+  if (!spec) throw unprocessable("Unknown CAR session trigger class");
+  const severityScore = Number(input.severityInputs.severityScore ?? input.severityInputs.score ?? 1);
+  const overloaded = input.openSessionCount >= input.sessionCap || input.openTaskCount >= input.taskCap;
+  const noOpReason = severityScore <= 0 ? spec.noOpRule : null;
+  return {
+    triggerClass: input.triggerClass,
+    producer: spec.source,
+    detector: spec.detector,
+    severity: severityScore >= 3 ? "high" : severityScore >= 2 ? "medium" : "low",
+    dedupeKey: input.dedupeKey,
+    capDecision: input.openSessionCount >= input.sessionCap ? "at_session_cap" : "within_session_cap",
+    overloadDecision: overloaded ? spec.overloadRule : "open_session_allowed",
+    noOpReason,
+    correctionTarget: input.correctionTarget ?? spec.correctionRule,
+    reopenTarget: input.reopenTarget ?? spec.reopenRule,
+    ownerRole: spec.ownerRole,
+    ownerExpiry: spec.persistentCompletionExpiry,
+  };
+}
+
+export function listCarSessionAdHocTriggerFramework() {
+  return [...CAR_SESSION_TRIGGER_FRAMEWORK];
+}
+
+export function sessionService(db: Db) {
+  const documents = documentService(db);
+  const adapter = createSessionStateAdapter(documents);
+  const issueSvc = issueService(db);
+
+  async function getIssue(issueId: string): Promise<SessionIssueRow | null> {
+    return db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        projectId: issues.projectId,
+        goalId: issues.goalId,
+        priority: issues.priority,
+        assigneeAgentId: issues.assigneeAgentId,
+        identifier: issues.identifier,
+        title: issues.title,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function assertParticipantAgent(companyId: string, agentId: string) {
+    const agent = await db
+      .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    if (!agent) throw notFound("Participant agent not found");
+    if (agent.companyId !== companyId) throw unprocessable("Participant agent must belong to session company");
+    if (agent.status === "pending_approval" || agent.status === "terminated") {
+      throw conflict("Participant agent cannot receive session obligations");
+    }
+  }
+
+  async function ensureParticipantObligations(
+    issue: SessionIssueRow,
+    state: PaperclipSessionDocument,
+    actor: { agentId?: string | null; userId?: string | null },
+  ) {
+    const next = cloneSessionDocument(state);
+    for (const participant of next.participants) {
+      if (!participant.agentId || participant.issueId) continue;
+      await assertParticipantAgent(issue.companyId, participant.agentId);
+      const obligation = await issueSvc.create(issue.companyId, {
+        projectId: issue.projectId,
+        goalId: issue.goalId,
+        parentId: issue.id,
+        title: `${next.sessionType} session obligation: ${participant.role}`,
+        description: [
+          next.objective,
+          "",
+          `Session issue: ${issue.identifier ?? issue.id}`,
+          `Proof target: respond through /api/sessions/respond with this assigned issue as evidence.`,
+        ].join("\n"),
+        status: "todo",
+        priority: issue.priority,
+        assigneeAgentId: participant.agentId,
+        createdByAgentId: actor.agentId ?? null,
+        createdByUserId: actor.userId ?? null,
+        originKind: "session_participant_obligation",
+        originId: issue.id,
+        originRunId: next.lastTransition.actor.runId ?? null,
+      });
+      participant.issueId = obligation.id;
+    }
+    return next;
+  }
+
+  async function inspect(input: { issueId: string; includeReceipts?: boolean }) {
+    const trusted = await adapter.read(input.issueId);
+    if (!trusted) throw notFound("Session not found");
+    const issue = await getIssue(input.issueId);
+    assertSessionIssueScope(issue, trusted.state.companyId);
+    const participantIssues = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        originRunId: issues.originRunId,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, trusted.state.companyId),
+        eq(issues.parentId, input.issueId),
+        eq(issues.originKind, "session_participant_obligation"),
+        eq(issues.originId, input.issueId),
+      ));
+
+    return {
+      companyId: trusted.state.companyId,
+      issue,
+      document: {
+        id: trusted.document.id,
+        key: trusted.document.key,
+        latestRevisionId: trusted.document.latestRevisionId,
+        latestRevisionNumber: trusted.document.latestRevisionNumber,
+      },
+      session: trusted.state,
+      transitionReceipt: trusted.transitionReceipt,
+      transitionReceiptDocument: {
+        id: trusted.transitionReceiptDocument.id,
+        key: trusted.transitionReceiptDocument.key,
+        latestRevisionId: trusted.transitionReceiptDocument.latestRevisionId,
+      },
+      participantIssues,
+      receipts: input.includeReceipts === false ? [] : trusted.state.receipts,
+      taskRoutes: trusted.state.taskRoutes,
+      reviews: trusted.state.reviews,
+      eodFindings: trusted.state.eodFindings,
+      health: trusted.state.health,
+    };
+  }
+
+  async function transition(input: PaperclipSessionTransitionRequest) {
+    const issue = await getIssue(input.issueId);
+    assertSessionIssueScope(issue, input.nextState.companyId);
+    const current = await adapter.read(input.issueId);
+    if (current && current.state.idempotencyKey === input.idempotencyKey) {
+      return { replayed: true, ...(await inspect({ issueId: input.issueId })) };
+    }
+    assertTransitionRequestMatchesNextState(input, current?.state ?? null);
+    assertAllowedTransition(current?.state.state ?? null, input.transition, input.nextState.state);
+    assertDecisionQuality(input.nextState);
+    const nextState = await ensureParticipantObligations(issue!, input.nextState, {
+      agentId: input.actor.agentId ?? null,
+      userId: input.actor.userId ?? null,
+    });
+    const written = await adapter.write({
+      issueId: input.issueId,
+      companyId: input.nextState.companyId,
+      expectedRevisionId: input.expectedRevisionId ?? null,
+      expectedState: input.expectedState ?? null,
+      nextState,
+      actorAgentId: input.actor.agentId ?? null,
+      actorUserId: input.actor.userId ?? null,
+      changeSummary: `session:${input.transition}`,
+    });
+    return { replayed: false, write: written, ...(await inspect({ issueId: input.issueId })) };
+  }
+
+  async function respond(input: PaperclipSessionResponseRequest) {
+    const trusted = await adapter.read(input.issueId);
+    if (!trusted) throw notFound("Session not found");
+    if (trusted.document.latestRevisionId !== input.expectedRevisionId) {
+      throw conflict("Session state was updated by someone else", {
+        currentRevisionId: trusted.document.latestRevisionId,
+      });
+    }
+    const participantIndex = trusted.state.participants.findIndex(
+      (participant) => participant.agentId === input.participantAgentId,
+    );
+    if (participantIndex < 0) throw forbidden("Authenticated agent is not a session participant");
+    if (input.actor.actorType !== "agent" || input.actor.agentId !== input.participantAgentId) {
+      throw forbidden("Session response actor must match participant agent");
+    }
+
+    const next = cloneSessionDocument(trusted.state);
+    const responseId =
+      typeof input.response.responseId === "string" && input.response.responseId.trim()
+        ? input.response.responseId.trim()
+        : randomUUID();
+    next.participants[participantIndex] = {
+      ...next.participants[participantIndex],
+      status: "responded",
+      responseId,
+      missedReason: null,
+    };
+    next.state = next.participants.every((participant) => participant.status === "responded" || participant.status === "excused")
+      ? "reviewing"
+      : "waiting_response";
+    next.stateRevision += 1;
+    next.idempotencyKey = `session-response:${input.issueId}:${input.participantAgentId}:${responseId}`;
+    next.lastTransition = {
+      transitionId: randomUUID(),
+      transition: "respond",
+      actor: input.actor,
+      beforeState: trusted.state.state,
+      afterState: next.state,
+      at: nowIso(),
+    };
+
+    const written = await adapter.write({
+      issueId: input.issueId,
+      companyId: trusted.state.companyId,
+      expectedRevisionId: input.expectedRevisionId,
+      expectedState: trusted.state.state,
+      nextState: next,
+      actorAgentId: input.participantAgentId,
+      changeSummary: "session:respond",
+    });
+    return { write: written, ...(await inspect({ issueId: input.issueId })) };
+  }
+
+  async function validateServiceRunAuthority(input: {
+    serviceRunId: string | null | undefined;
+    companyId: string;
+    policyKey: string;
+    sessionType: string;
+  }): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (!input.serviceRunId) return { ok: false, reason: "service_run_missing" };
+    const run = await db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, input.serviceRunId))
+      .then((rows) => rows[0] ?? null);
+    if (!run) return { ok: false, reason: "service_run_not_found" };
+    if (run.companyId !== input.companyId) return { ok: false, reason: "service_run_company_mismatch" };
+    if (["failed", "cancelled", "timed_out"].includes(run.status)) return { ok: false, reason: "service_run_not_active" };
+    const snapshot = asRecord(run.contextSnapshot);
+    const policyKey = typeof snapshot.policyKey === "string" ? snapshot.policyKey : null;
+    if (policyKey !== input.policyKey) return { ok: false, reason: "service_run_policy_mismatch" };
+    const allowedSessionTypes = Array.isArray(snapshot.allowedSessionTypes)
+      ? snapshot.allowedSessionTypes.filter((value): value is string => typeof value === "string")
+      : typeof snapshot.sessionType === "string"
+        ? [snapshot.sessionType]
+        : [];
+    if (!allowedSessionTypes.includes(input.sessionType)) {
+      return { ok: false, reason: "service_run_session_type_mismatch" };
+    }
+    if (snapshot.revokedAt || snapshot.routerRevoked === true || snapshot.routerKillSwitch === true) {
+      return { ok: false, reason: "service_run_router_revoked" };
+    }
+    return { ok: true };
+  }
+
+  async function appendTaskRouteReceipt(input: {
+    trusted: Awaited<ReturnType<typeof readTrustedSessionDocument>>;
+    route: PaperclipTaskRouteReceipt;
+    actor: PaperclipSessionActor;
+    expectedRevisionId: string;
+  }) {
+    if (!input.trusted) throw notFound("Session not found");
+    const next = cloneSessionDocument(input.trusted.state);
+    next.taskRoutes = [...next.taskRoutes, input.route];
+    next.stateRevision += 1;
+    next.idempotencyKey = `session-task-route:${input.route.routeId}`;
+    next.lastTransition = buildLastTransition({ current: input.trusted.state, transition: "route_task", actor: input.actor });
+    const written = await adapter.write({
+      issueId: input.trusted.state.issueId,
+      companyId: input.trusted.state.companyId,
+      expectedRevisionId: input.expectedRevisionId,
+      expectedState: input.trusted.state.state,
+      nextState: next,
+      actorAgentId: input.actor.agentId ?? null,
+      actorUserId: input.actor.userId ?? null,
+      changeSummary: "session:route-task",
+    });
+    return written;
+  }
+
+  async function routeTask(input: PaperclipSessionTaskRouteRequest) {
+    assertTaskRouteBoundary(input);
+    const trusted = await adapter.read(input.issueId);
+    if (!trusted) throw notFound("Session not found");
+    if (trusted.document.latestRevisionId !== input.expectedRevisionId) {
+      throw conflict("Session state was updated by someone else", {
+        currentRevisionId: trusted.document.latestRevisionId,
+      });
+    }
+    const issue = await getIssue(input.issueId);
+    assertSessionIssueScope(issue, trusted.state.companyId);
+    let assigneeAgentId = input.assigneeAgentId ?? null;
+    let authorityPath: PaperclipTaskRouteReceipt["authorityPath"] = input.serviceRunId ? "service" : "direct";
+    let blockedReason: string | null = null;
+
+    if (!assigneeAgentId) {
+      assigneeAgentId = trusted.state.participants.find((participant) => participant.role === input.targetRole)?.agentId ?? null;
+      authorityPath = assigneeAgentId ? "multi_actor_fallback" : "failed_router";
+      if (!assigneeAgentId) blockedReason = "target_role_has_no_participant_agent";
+    }
+
+    if (input.serviceRunId) {
+      const authority = await validateServiceRunAuthority({
+        serviceRunId: input.serviceRunId,
+        companyId: trusted.state.companyId,
+        policyKey: trusted.state.policyKey,
+        sessionType: trusted.state.sessionType,
+      });
+      if (!authority.ok) {
+        blockedReason = authority.reason;
+        authorityPath = input.allowDirectFallback && assigneeAgentId ? "direct" : "failed_router";
+      }
+    }
+
+    let createdIssueId: string | null = null;
+    if (authorityPath !== "failed_router" && assigneeAgentId) {
+      await assertParticipantAgent(trusted.state.companyId, assigneeAgentId);
+      const created = await issueSvc.create(trusted.state.companyId, {
+        projectId: issue!.projectId,
+        goalId: issue!.goalId,
+        parentId: input.issueId,
+        title: input.title,
+        description: input.description,
+        status: "todo",
+        priority: input.priority,
+        assigneeAgentId,
+        createdByAgentId: input.actor.agentId ?? null,
+        createdByUserId: input.actor.userId ?? null,
+        originKind: "session_task_route",
+        originId: input.issueId,
+        originRunId: input.serviceRunId ?? input.actor.runId ?? null,
+      });
+      createdIssueId = created.id;
+    }
+
+    const route: PaperclipTaskRouteReceipt = {
+      routeId: randomUUID(),
+      authorityPath,
+      companyId: trusted.state.companyId,
+      policyKey: trusted.state.policyKey,
+      sessionType: trusted.state.sessionType,
+      sourceFindingId: input.sourceFindingId,
+      intendedOwnerRole: input.intendedOwnerRole,
+      targetRole: input.targetRole,
+      createdIssueId,
+      actor: input.actor,
+      serviceRunId: input.serviceRunId ?? null,
+      routerRevoked: blockedReason === "service_run_router_revoked",
+      blockedReason,
+    };
+    const write = await appendTaskRouteReceipt({
+      trusted,
+      route,
+      actor: input.actor,
+      expectedRevisionId: input.expectedRevisionId,
+    });
+    return { route, write, ...(await inspect({ issueId: input.issueId })) };
+  }
+
+  async function redactReceipt(input: PaperclipSessionReceiptRedactionRequest) {
+    const trusted = await adapter.read(input.issueId);
+    if (!trusted) throw notFound("Session not found");
+    if (trusted.document.latestRevisionId !== input.expectedRevisionId) {
+      throw conflict("Session state was updated by someone else", {
+        currentRevisionId: trusted.document.latestRevisionId,
+      });
+    }
+    const managerReceiptId = randomUUID();
+    const participantReceiptId = randomUUID();
+    const manager = await documents.upsertIssueDocument({
+      issueId: input.issueId,
+      key: `${PAPERCLIP_SESSION_RECEIPT_DOCUMENT_KEY_PREFIX}${managerReceiptId}`,
+      title: "Session manager receipt",
+      format: "markdown",
+      body: `${JSON.stringify(input.redaction.managerReceipt, null, 2)}\n`,
+      createdByAgentId: input.actor.agentId ?? null,
+      createdByUserId: input.actor.userId ?? null,
+      allowReservedSessionDocumentKey: true,
+      expectedCompanyId: trusted.state.companyId,
+    });
+    const participant = await documents.upsertIssueDocument({
+      issueId: input.issueId,
+      key: `${PAPERCLIP_SESSION_RECEIPT_DOCUMENT_KEY_PREFIX}${participantReceiptId}`,
+      title: "Session participant redacted receipt",
+      format: "markdown",
+      body: `${JSON.stringify(input.redaction.participantReceipt, null, 2)}\n`,
+      createdByAgentId: input.actor.agentId ?? null,
+      createdByUserId: input.actor.userId ?? null,
+      allowReservedSessionDocumentKey: true,
+      expectedCompanyId: trusted.state.companyId,
+    });
+
+    const next = cloneSessionDocument(trusted.state);
+    next.receipts = [
+      ...next.receipts,
+      {
+        receiptId: managerReceiptId,
+        auditId: input.redaction.auditId,
+        visibility: "manager_audit",
+        issueId: input.issueId,
+        documentId: manager.document.id,
+        redacted: false,
+        createdAt: nowIso(),
+      },
+      {
+        receiptId: participantReceiptId,
+        auditId: input.redaction.auditId,
+        visibility: "participant_redacted",
+        issueId: input.issueId,
+        documentId: participant.document.id,
+        redacted: true,
+        createdAt: nowIso(),
+      },
+    ];
+    next.stateRevision += 1;
+    next.idempotencyKey = `session-redact:${input.issueId}:${input.redaction.auditId}`;
+    next.lastTransition = buildLastTransition({ current: trusted.state, transition: "redact_receipt", actor: input.actor });
+    const write = await adapter.write({
+      issueId: input.issueId,
+      companyId: trusted.state.companyId,
+      expectedRevisionId: input.expectedRevisionId,
+      expectedState: trusted.state.state,
+      nextState: next,
+      actorAgentId: input.actor.agentId ?? null,
+      actorUserId: input.actor.userId ?? null,
+      changeSummary: "session:redact-receipt",
+    });
+    return { write, redactedReceipts: next.receipts, ...(await inspect({ issueId: input.issueId })) };
+  }
+
+  async function rollbackDisable(input: {
+    companyId: string;
+    policyKey: string;
+    sessionType: PaperclipSessionDocument["sessionType"];
+    triggerClass: string;
+    expectedNoNewSessionProof: string;
+    actor: PaperclipSessionActor;
+  }) {
+    const disabled = await db
+      .update(routines)
+      .set({ status: "paused", updatedAt: new Date() })
+      .where(and(
+        eq(routines.companyId, input.companyId),
+        eq(routines.status, "active"),
+        sql`${routines.linkedSessionPolicy}->>'policyKey' = ${input.policyKey}`,
+        sql`${routines.linkedSessionPolicy}->>'sessionType' = ${input.sessionType}`,
+      ))
+      .returning({ id: routines.id, title: routines.title });
+    return {
+      companyId: input.companyId,
+      policyKey: input.policyKey,
+      sessionType: input.sessionType,
+      triggerClass: input.triggerClass,
+      disabledRoutineIds: disabled.map((row) => row.id),
+      preservedHistory: true,
+      futureTriggersDisabled: true,
+      expectedNoNewSessionProof: input.expectedNoNewSessionProof,
+      auditId: randomUUID(),
+      actor: input.actor,
+    };
+  }
+
+  return {
+    inspect,
+    transition,
+    respond,
+    routeTask,
+    redactReceipt,
+    rollbackDisable,
+    validateServiceRunAuthority,
+    evaluateAdHocTrigger: evaluateCarSessionAdHocTrigger,
+    listAdHocTriggerFramework: listCarSessionAdHocTriggerFramework,
+  };
 }

@@ -34,6 +34,7 @@ export const paperclipSessionTransitionSchema = z.enum([
   "redirect",
   "dispose_finding",
   "route_task",
+  "redact_receipt",
   "reopen",
   "complete",
   "block",
@@ -263,6 +264,64 @@ export const paperclipSessionRollbackDisableRequestSchema = z
   })
   .strict();
 
+export const paperclipLinkedSessionRoutineParticipantSchema = z
+  .object({
+    role: nonEmptyString,
+    agentId: z.string().uuid(),
+  })
+  .strict();
+
+export const paperclipLinkedSessionRoutinePolicySchema = z
+  .object({
+    policyKey: nonEmptyString,
+    policyVersion: nonEmptyString,
+    sessionType: paperclipSessionTypeSchema,
+    objective: z.string().trim().min(1),
+    participants: z.array(paperclipLinkedSessionRoutineParticipantSchema).min(1),
+    source: paperclipSessionSourceSchema.optional(),
+  })
+  .strict();
+
+export const paperclipSessionTaskRouteRequestSchema = z
+  .object({
+    issueId: z.string().uuid(),
+    expectedRevisionId: z.string().uuid(),
+    sourceFindingId: nonEmptyString,
+    intendedOwnerRole: nonEmptyString,
+    targetRole: nonEmptyString,
+    title: z.string().trim().min(1).max(200),
+    description: z.string().trim().min(1).max(10_000),
+    priority: z.enum(["critical", "high", "medium", "low"]).optional().default("medium"),
+    assigneeAgentId: optionalUuid,
+    serviceRunId: optionalUuid,
+    allowDirectFallback: z.boolean().optional().default(false),
+    actor: paperclipSessionActorSchema,
+  })
+  .strict();
+
+export const paperclipSessionReceiptRedactionRequestSchema = z
+  .object({
+    issueId: z.string().uuid(),
+    expectedRevisionId: z.string().uuid(),
+    redaction: paperclipSessionReceiptRedactionSchema,
+    actor: paperclipSessionActorSchema,
+  })
+  .strict();
+
+export const carSessionTriggerEvaluationRequestSchema = z
+  .object({
+    triggerClass: paperclipAdHocTriggerClassSchema,
+    severityInputs: jsonRecord,
+    dedupeKey: nonEmptyString,
+    openSessionCount: z.number().int().nonnegative().optional().default(0),
+    openTaskCount: z.number().int().nonnegative().optional().default(0),
+    sessionCap: z.number().int().positive().optional().default(3),
+    taskCap: z.number().int().positive().optional().default(12),
+    correctionTarget: z.string().nullable().optional(),
+    reopenTarget: z.string().nullable().optional(),
+  })
+  .strict();
+
 export const carSessionTriggerSpecSchema = z
   .object({
     triggerClass: paperclipAdHocTriggerClassSchema,
@@ -309,14 +368,19 @@ export const carSessionPolicySchema = z
 export type PaperclipSessionType = z.infer<typeof paperclipSessionTypeSchema>;
 export type PaperclipSessionState = z.infer<typeof paperclipSessionStateSchema>;
 export type PaperclipSessionTransition = z.infer<typeof paperclipSessionTransitionSchema>;
+export type PaperclipSessionActor = z.infer<typeof paperclipSessionActorSchema>;
 export type PaperclipSessionDocument = z.infer<typeof paperclipSessionDocumentSchema>;
 export type PaperclipSessionTransitionReceiptDocument = z.infer<typeof paperclipSessionTransitionReceiptDocumentSchema>;
 export type PaperclipSessionTransitionRequest = z.infer<typeof paperclipSessionTransitionRequestSchema>;
 export type PaperclipSessionResponseRequest = z.infer<typeof paperclipSessionResponseRequestSchema>;
 export type PaperclipSessionInspectRequest = z.infer<typeof paperclipSessionInspectRequestSchema>;
 export type PaperclipSessionReceiptRedaction = z.infer<typeof paperclipSessionReceiptRedactionSchema>;
+export type PaperclipSessionReceiptRedactionRequest = z.infer<typeof paperclipSessionReceiptRedactionRequestSchema>;
 export type PaperclipSessionRollbackDisableRequest = z.infer<typeof paperclipSessionRollbackDisableRequestSchema>;
+export type PaperclipSessionTaskRouteRequest = z.infer<typeof paperclipSessionTaskRouteRequestSchema>;
 export type PaperclipTaskRouteReceipt = z.infer<typeof paperclipTaskRouteReceiptSchema>;
 export type PaperclipSessionHealthObservation = z.infer<typeof paperclipSessionHealthObservationSchema>;
+export type PaperclipLinkedSessionRoutinePolicy = z.infer<typeof paperclipLinkedSessionRoutinePolicySchema>;
+export type CarSessionTriggerEvaluationRequest = z.infer<typeof carSessionTriggerEvaluationRequestSchema>;
 export type CarSessionPolicy = z.infer<typeof carSessionPolicySchema>;
 export type CarSessionTriggerSpec = z.infer<typeof carSessionTriggerSpecSchema>;
