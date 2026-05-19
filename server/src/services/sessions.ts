@@ -22,6 +22,8 @@ import {
 import {
   activityLog,
   agents,
+  documentRevisions as documentRevisionTable,
+  documents as documentTable,
   heartbeatRuns,
   issueComments,
   issueDocuments,
@@ -1429,29 +1431,75 @@ export function sessionService(db: Db) {
       });
     }
     const managerReceiptId = randomUUID();
-    const participantReceiptId = randomUUID();
-    const manager = await documents.upsertIssueDocument({
-      issueId: input.issueId,
-      key: `${PAPERCLIP_SESSION_RECEIPT_DOCUMENT_KEY_PREFIX}${managerReceiptId}`,
-      title: "Session manager receipt",
-      format: "markdown",
-      body: `${JSON.stringify(input.redaction.managerReceipt, null, 2)}\n`,
-      createdByAgentId: input.actor.agentId ?? null,
-      createdByUserId: input.actor.userId ?? null,
-      allowReservedSessionDocumentKey: true,
-      expectedCompanyId: trusted.state.companyId,
+    const managerAuditDocument = await db.transaction(async (tx) => {
+      const now = new Date();
+      const body = `${JSON.stringify(input.redaction.managerReceipt, null, 2)}\n`;
+      const [document] = await tx
+        .insert(documentTable)
+        .values({
+          companyId: trusted.state.companyId,
+          title: "Session manager audit receipt",
+          format: "markdown",
+          latestBody: body,
+          latestRevisionId: null,
+          latestRevisionNumber: 1,
+          createdByAgentId: input.actor.agentId ?? null,
+          createdByUserId: input.actor.userId ?? null,
+          updatedByAgentId: input.actor.agentId ?? null,
+          updatedByUserId: input.actor.userId ?? null,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+      const [revision] = await tx
+        .insert(documentRevisionTable)
+        .values({
+          companyId: trusted.state.companyId,
+          documentId: document.id,
+          revisionNumber: 1,
+          body,
+          changeSummary: "session:manager-audit-receipt",
+          createdByAgentId: input.actor.agentId ?? null,
+          createdByUserId: input.actor.userId ?? null,
+          createdAt: now,
+        })
+        .returning();
+      await tx
+        .update(documentTable)
+        .set({ latestRevisionId: revision.id })
+        .where(eq(documentTable.id, document.id));
+      return { ...document, latestRevisionId: revision.id };
     });
-    const participant = await documents.upsertIssueDocument({
-      issueId: input.issueId,
-      key: `${PAPERCLIP_SESSION_RECEIPT_DOCUMENT_KEY_PREFIX}${participantReceiptId}`,
-      title: "Session participant redacted receipt",
-      format: "markdown",
-      body: `${JSON.stringify(input.redaction.participantReceipt, null, 2)}\n`,
-      createdByAgentId: input.actor.agentId ?? null,
-      createdByUserId: input.actor.userId ?? null,
-      allowReservedSessionDocumentKey: true,
-      expectedCompanyId: trusted.state.companyId,
-    });
+    const participantIssueIds = trusted.state.participants
+      .map((participant) => participant.issueId)
+      .filter((issueId): issueId is string => typeof issueId === "string" && issueId.length > 0);
+    if (participantIssueIds.length === 0) {
+      throw unprocessable("Participant redacted receipt requires participant obligation issues");
+    }
+    const participantReceipts = [];
+    for (const participantIssueId of participantIssueIds) {
+      const participantReceiptId = randomUUID();
+      const participant = await documents.upsertIssueDocument({
+        issueId: participantIssueId,
+        key: `${PAPERCLIP_SESSION_RECEIPT_DOCUMENT_KEY_PREFIX}${participantReceiptId}`,
+        title: "Session participant redacted receipt",
+        format: "markdown",
+        body: `${JSON.stringify(input.redaction.participantReceipt, null, 2)}\n`,
+        createdByAgentId: input.actor.agentId ?? null,
+        createdByUserId: input.actor.userId ?? null,
+        allowReservedSessionDocumentKey: true,
+        expectedCompanyId: trusted.state.companyId,
+      });
+      participantReceipts.push({
+        receiptId: participantReceiptId,
+        auditId: input.redaction.auditId,
+        visibility: "participant_redacted" as const,
+        issueId: participantIssueId,
+        documentId: participant.document.id,
+        redacted: true,
+        createdAt: nowIso(),
+      });
+    }
 
     const next = cloneSessionDocument(trusted.state);
     next.receipts = [
@@ -1460,20 +1508,12 @@ export function sessionService(db: Db) {
         receiptId: managerReceiptId,
         auditId: input.redaction.auditId,
         visibility: "manager_audit",
-        issueId: input.issueId,
-        documentId: manager.document.id,
+        issueId: null,
+        documentId: managerAuditDocument.id,
         redacted: false,
         createdAt: nowIso(),
       },
-      {
-        receiptId: participantReceiptId,
-        auditId: input.redaction.auditId,
-        visibility: "participant_redacted",
-        issueId: input.issueId,
-        documentId: participant.document.id,
-        redacted: true,
-        createdAt: nowIso(),
-      },
+      ...participantReceipts,
     ];
     next.stateRevision += 1;
     next.idempotencyKey = `session-redact:${input.issueId}:${input.redaction.auditId}`;

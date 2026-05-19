@@ -77,6 +77,29 @@ export function sessionRoutes(db: Db) {
     }
   }
 
+  function filterInspectForActor(req: Request, result: any) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return result;
+    const participantIssueIds = new Set(
+      (Array.isArray(result.participantIssues) ? result.participantIssues : [])
+        .filter((issue: any) => issue?.assigneeAgentId === req.actor.agentId)
+        .map((issue: any) => issue.id)
+        .filter((id: unknown): id is string => typeof id === "string" && id.length > 0),
+    );
+    const filterReceipts = (receipts: unknown) => (
+      Array.isArray(receipts)
+        ? receipts.filter((receipt: any) =>
+          receipt?.visibility === "participant_redacted" &&
+          typeof receipt.issueId === "string" &&
+          participantIssueIds.has(receipt.issueId))
+        : []
+    );
+    const receipts = filterReceipts(result.receipts);
+    const session = result.session && typeof result.session === "object"
+      ? { ...result.session, receipts: filterReceipts(result.session.receipts) }
+      : result.session;
+    return { ...result, session, receipts };
+  }
+
   router.post("/sessions/transition", validate(paperclipSessionTransitionRequestSchema), async (req, res) => {
     await assertSessionOperator(req, req.body.nextState.companyId);
     assertSameSessionActor(req, req.body.actor);
@@ -109,7 +132,7 @@ export function sessionRoutes(db: Db) {
   router.post("/sessions/inspect", validate(paperclipSessionInspectRequestSchema), async (req, res) => {
     const result = await svc.inspect(req.body);
     assertCompanyAccess(req, result.companyId);
-    res.json(result);
+    res.json(filterInspectForActor(req, result));
   });
 
   router.post("/sessions/task-route", validate(paperclipSessionTaskRouteRequestSchema), async (req, res) => {

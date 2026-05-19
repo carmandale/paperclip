@@ -265,4 +265,57 @@ describe("session routes", () => {
     expect(res.status).toBe(403);
     expect(mockSessionService.redactReceipt).not.toHaveBeenCalled();
   });
+
+  it("filters manager audit receipts from agent inspect responses", async () => {
+    const participantIssueId = "77777777-7777-4777-8777-777777777777";
+    const otherParticipantIssueId = "88888888-8888-4888-8888-888888888888";
+    const receipts = [
+      {
+        receiptId: "manager-receipt",
+        visibility: "manager_audit",
+        issueId: null,
+        documentId: "99999999-9999-4999-8999-999999999999",
+        redacted: false,
+      },
+      {
+        receiptId: "participant-receipt",
+        visibility: "participant_redacted",
+        issueId: participantIssueId,
+        documentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        redacted: true,
+      },
+      {
+        receiptId: "other-participant-receipt",
+        visibility: "participant_redacted",
+        issueId: otherParticipantIssueId,
+        documentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        redacted: true,
+      },
+    ];
+    mockSessionService.inspect.mockResolvedValue({
+      companyId,
+      participantIssues: [
+        { id: participantIssueId, assigneeAgentId: participantAgentId },
+        { id: otherParticipantIssueId, assigneeAgentId: "99999999-1111-4111-8111-111111111111" },
+      ],
+      session: { state: "reviewing", receipts },
+      receipts,
+    });
+    const app = createApp({
+      type: "agent",
+      agentId: participantAgentId,
+      companyId,
+      runId,
+    });
+
+    const res = await request(app).post("/api/sessions/inspect").send({
+      issueId,
+      includeReceipts: true,
+      actor: agentActor,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.receipts).toEqual([receipts[1]]);
+    expect(res.body.session.receipts).toEqual([receipts[1]]);
+  });
 });

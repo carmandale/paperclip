@@ -1167,6 +1167,31 @@ describeEmbeddedPostgres("Paperclip session service integration", () => {
       "manager_audit",
       "participant_redacted",
     ]);
+    const participantReceipt = redacted.receipts.find((receipt) => receipt.visibility === "participant_redacted");
+    const managerReceipt = redacted.receipts.find((receipt) => receipt.visibility === "manager_audit");
+    expect(participantReceipt?.issueId).toBe(created.participantIssues[0]?.id);
+    expect(participantReceipt?.documentId).toBeTruthy();
+    expect(managerReceipt?.issueId).toBeNull();
+    expect(managerReceipt?.documentId).toBeTruthy();
+    const receiptDocumentLinks = await db
+      .select({
+        issueId: issueDocuments.issueId,
+        documentId: issueDocuments.documentId,
+        body: documents.latestBody,
+      })
+      .from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .where(eq(issueDocuments.companyId, fixture.companyId));
+    expect(receiptDocumentLinks.some((row) => row.documentId === managerReceipt?.documentId)).toBe(false);
+    const participantDocument = receiptDocumentLinks.find((row) => row.documentId === participantReceipt?.documentId);
+    expect(participantDocument?.issueId).toBe(participantReceipt?.issueId);
+    expect(participantDocument?.body).toContain("[redacted]");
+    expect(participantDocument?.body).not.toContain("manager-only");
+    const [managerDocument] = await db
+      .select({ body: documents.latestBody })
+      .from(documents)
+      .where(eq(documents.id, managerReceipt!.documentId!));
+    expect(managerDocument?.body).toContain("manager-only");
     const missingRouterRunId = randomUUID();
     const failedRoute = await sessionService(db).routeTask({
       issueId: fixture.sessionIssue.id,
