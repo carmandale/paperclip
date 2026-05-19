@@ -5,6 +5,7 @@ const optionalUuid = z.string().uuid().nullable().optional();
 const jsonRecord = z.record(z.unknown());
 
 export const PAPERCLIP_SESSION_DOCUMENT_KEY = "session" as const;
+export const PAPERCLIP_SESSION_RECEIPT_DOCUMENT_KEY_PREFIX = "session-receipt-" as const;
 export const PAPERCLIP_SESSION_SCHEMA_VERSION = 1 as const;
 
 export const paperclipSessionTypeSchema = z.enum(["working", "review", "eod", "ad_hoc"]);
@@ -178,16 +179,37 @@ export const paperclipSessionDocumentSchema = z
     health: z.array(paperclipSessionHealthObservationSchema).optional().default([]),
     lastTransition: z
       .object({
-        transitionId: nonEmptyString,
+        transitionId: z.string().uuid(),
         transition: paperclipSessionTransitionSchema,
         actor: paperclipSessionActorSchema,
         beforeState: paperclipSessionStateSchema.nullable(),
         afterState: paperclipSessionStateSchema,
         at: z.string().datetime(),
       })
-      .strict()
-      .nullable()
-      .optional(),
+      .strict(),
+  })
+  .strict();
+
+export const paperclipSessionTransitionReceiptDocumentSchema = z
+  .object({
+    schemaVersion: z.literal(PAPERCLIP_SESSION_SCHEMA_VERSION),
+    receiptType: z.literal("session_transition"),
+    recordedBy: z.literal("paperclip-session-service"),
+    companyId: z.string().uuid(),
+    issueId: z.string().uuid(),
+    policyKey: nonEmptyString,
+    policyVersion: nonEmptyString,
+    sessionType: paperclipSessionTypeSchema,
+    sessionDocumentId: z.string().uuid(),
+    sessionRevisionId: z.string().uuid(),
+    stateRevision: z.number().int().nonnegative(),
+    idempotencyKey: nonEmptyString,
+    transitionId: z.string().uuid(),
+    transition: paperclipSessionTransitionSchema,
+    actor: paperclipSessionActorSchema,
+    beforeState: paperclipSessionStateSchema.nullable(),
+    afterState: paperclipSessionStateSchema,
+    createdAt: z.string().datetime(),
   })
   .strict();
 
@@ -288,6 +310,7 @@ export type PaperclipSessionType = z.infer<typeof paperclipSessionTypeSchema>;
 export type PaperclipSessionState = z.infer<typeof paperclipSessionStateSchema>;
 export type PaperclipSessionTransition = z.infer<typeof paperclipSessionTransitionSchema>;
 export type PaperclipSessionDocument = z.infer<typeof paperclipSessionDocumentSchema>;
+export type PaperclipSessionTransitionReceiptDocument = z.infer<typeof paperclipSessionTransitionReceiptDocumentSchema>;
 export type PaperclipSessionTransitionRequest = z.infer<typeof paperclipSessionTransitionRequestSchema>;
 export type PaperclipSessionResponseRequest = z.infer<typeof paperclipSessionResponseRequestSchema>;
 export type PaperclipSessionInspectRequest = z.infer<typeof paperclipSessionInspectRequestSchema>;

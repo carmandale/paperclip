@@ -272,6 +272,7 @@ export {
 
 export {
   PAPERCLIP_SESSION_DOCUMENT_KEY,
+  PAPERCLIP_SESSION_RECEIPT_DOCUMENT_KEY_PREFIX,
   PAPERCLIP_SESSION_SCHEMA_VERSION,
   paperclipSessionTypeSchema,
   paperclipSessionStateSchema,
@@ -289,6 +290,7 @@ export {
   paperclipSessionEodFindingSchema,
   paperclipSessionHealthObservationSchema,
   paperclipSessionDocumentSchema,
+  paperclipSessionTransitionReceiptDocumentSchema,
   paperclipSessionTransitionRequestSchema,
   paperclipSessionResponseRequestSchema,
   paperclipSessionInspectRequestSchema,
@@ -300,6 +302,7 @@ export {
   type PaperclipSessionState,
   type PaperclipSessionTransition,
   type PaperclipSessionDocument,
+  type PaperclipSessionTransitionReceiptDocument,
   type PaperclipSessionTransitionRequest,
   type PaperclipSessionResponseRequest,
   type PaperclipSessionInspectRequest,

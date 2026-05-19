@@ -7,6 +7,8 @@ import {
   createSessionStateAdapter,
   evaluateSessionStateModelReadiness,
   parseSessionDocumentBody,
+  parseSessionTransitionReceiptBody,
+  sessionTransitionReceiptDocumentKey,
 } from "../services/sessions.ts";
 
 type FakeDocument = {
@@ -30,6 +32,7 @@ type FakeDocument = {
 function makeSession(overrides: Partial<PaperclipSessionDocument> = {}): PaperclipSessionDocument {
   const companyId = overrides.companyId ?? randomUUID();
   const issueId = overrides.issueId ?? randomUUID();
+  const state = overrides.state ?? "open";
   const now = "2026-05-18T19:00:00.000Z";
   return {
     schemaVersion: PAPERCLIP_SESSION_SCHEMA_VERSION,
@@ -38,7 +41,7 @@ function makeSession(overrides: Partial<PaperclipSessionDocument> = {}): Papercl
     companyId,
     issueId,
     sessionType: "eod",
-    state: "open",
+    state,
     stateRevision: 0,
     idempotencyKey: `session:${issueId}`,
     objective: "Turn one material CAR finding into an owner-bound next action.",
@@ -65,23 +68,31 @@ function makeSession(overrides: Partial<PaperclipSessionDocument> = {}): Papercl
       transitionId: randomUUID(),
       transition: "create",
       actor: { actorType: "service", actorId: "session-service", runId: randomUUID() },
-      beforeState: null,
-      afterState: "open",
+      beforeState: state === "open" ? null : "open",
+      afterState: state,
       at: now,
     },
     ...overrides,
   };
 }
 
-function createFakeStore(initial?: FakeDocument | null) {
-  let document = initial ?? null;
+function createFakeStore(initial?: FakeDocument | FakeDocument[] | null) {
+  const docs = new Map<string, FakeDocument>();
+  const makeKey = (issueId: string, key: string) => `${issueId}:${key}`;
+  const initialDocs = Array.isArray(initial) ? initial : initial ? [initial] : [];
+  for (const doc of initialDocs) {
+    docs.set(makeKey(doc.issueId, doc.key), doc);
+  }
+
   return {
     get document() {
-      return document;
+      return [...docs.values()].find((doc) => doc.key === "session") ?? null;
+    },
+    getDocument(issueId: string, key: string) {
+      return docs.get(makeKey(issueId, key)) ?? null;
     },
     async getIssueDocumentByKey(issueId: string, key: string) {
-      if (document?.issueId === issueId && document.key === key) return document;
-      return null;
+      return docs.get(makeKey(issueId, key)) ?? null;
     },
     async upsertIssueDocument(input: {
       issueId: string;
@@ -92,27 +103,30 @@ function createFakeStore(initial?: FakeDocument | null) {
       baseRevisionId?: string | null;
       createdByAgentId?: string | null;
       createdByUserId?: string | null;
+      expectedCompanyId?: string | null;
     }) {
       const now = new Date("2026-05-18T19:00:00.000Z");
-      const created = !document;
+      const existing = docs.get(makeKey(input.issueId, input.key)) ?? null;
+      const created = !existing;
       const revisionId = randomUUID();
-      document = {
-        id: document?.id ?? randomUUID(),
-        companyId: document?.companyId ?? randomUUID(),
+      const document = {
+        id: existing?.id ?? randomUUID(),
+        companyId: existing?.companyId ?? input.expectedCompanyId ?? randomUUID(),
         issueId: input.issueId,
         key: input.key,
         title: input.title ?? null,
         format: input.format,
         body: input.body,
         latestRevisionId: revisionId,
-        latestRevisionNumber: (document?.latestRevisionNumber ?? 0) + 1,
-        createdByAgentId: document?.createdByAgentId ?? input.createdByAgentId ?? null,
-        createdByUserId: document?.createdByUserId ?? input.createdByUserId ?? null,
+        latestRevisionNumber: (existing?.latestRevisionNumber ?? 0) + 1,
+        createdByAgentId: existing?.createdByAgentId ?? input.createdByAgentId ?? null,
+        createdByUserId: existing?.createdByUserId ?? input.createdByUserId ?? null,
         updatedByAgentId: input.createdByAgentId ?? null,
         updatedByUserId: input.createdByUserId ?? null,
-        createdAt: document?.createdAt ?? now,
+        createdAt: existing?.createdAt ?? now,
         updatedAt: now,
       };
+      docs.set(makeKey(input.issueId, input.key), document);
       return { created, document };
     },
   };
@@ -143,6 +157,7 @@ describe("session document contract", () => {
     const companyId = randomUUID();
     const created = await adapter.write({
       issueId,
+      companyId,
       nextState: makeSession({ companyId, issueId }),
       actorAgentId: randomUUID(),
     });
@@ -151,14 +166,23 @@ describe("session document contract", () => {
     expect(created.before).toBeNull();
     expect(created.afterRevisionId).toBeTruthy();
     expect(store.document?.body.endsWith("\n")).toBe(true);
+    const receiptDoc = store.getDocument(issueId, sessionTransitionReceiptDocumentKey(created.after.lastTransition.transitionId));
+    expect(receiptDoc).toBeTruthy();
+    const receipt = parseSessionTransitionReceiptBody(receiptDoc?.body ?? "");
+    expect(receipt.recordedBy).toBe("paperclip-session-service");
+    expect(receipt.companyId).toBe(companyId);
+    expect(receipt.issueId).toBe(issueId);
+    expect(receipt.sessionRevisionId).toBe(created.afterRevisionId);
 
     await expect(adapter.write({
       issueId,
+      companyId,
       nextState: makeSession({ companyId, issueId, state: "waiting_response", stateRevision: 1 }),
     })).rejects.toMatchObject({ status: 409 });
 
     await expect(adapter.write({
       issueId,
+      companyId,
       expectedRevisionId: randomUUID(),
       expectedState: "open",
       nextState: makeSession({ companyId, issueId, state: "waiting_response", stateRevision: 1 }),
@@ -166,6 +190,7 @@ describe("session document contract", () => {
 
     await expect(adapter.write({
       issueId,
+      companyId,
       expectedRevisionId: created.afterRevisionId,
       expectedState: "completed",
       nextState: makeSession({ companyId, issueId, state: "waiting_response", stateRevision: 1 }),
@@ -173,6 +198,7 @@ describe("session document contract", () => {
 
     const updated = await adapter.write({
       issueId,
+      companyId,
       expectedRevisionId: created.afterRevisionId,
       expectedState: "open",
       nextState: makeSession({ companyId, issueId, state: "waiting_response", stateRevision: 1 }),
@@ -183,6 +209,47 @@ describe("session document contract", () => {
     expect(updated.after.state).toBe("waiting_response");
     expect(updated.beforeRevisionId).toBe(created.afterRevisionId);
     expect(updated.afterRevisionId).not.toBe(created.afterRevisionId);
+  });
+
+  it("rejects schema-valid generic session documents without a matching service transition receipt", async () => {
+    const issueId = randomUUID();
+    const companyId = randomUUID();
+    const session = makeSession({ companyId, issueId });
+    const store = createFakeStore({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      key: "session",
+      title: "Generic session write",
+      format: "markdown",
+      body: JSON.stringify(session),
+      latestRevisionId: randomUUID(),
+      latestRevisionNumber: 1,
+      createdByAgentId: null,
+      createdByUserId: "board-user",
+      updatedByAgentId: null,
+      updatedByUserId: "board-user",
+      createdAt: new Date("2026-05-18T19:00:00.000Z"),
+      updatedAt: new Date("2026-05-18T19:00:00.000Z"),
+    });
+    const adapter = createSessionStateAdapter(store);
+
+    await expect(adapter.read(issueId)).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("rejects session bodies whose issue or company scope does not match the envelope", async () => {
+    const issueId = randomUUID();
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const store = createFakeStore();
+    const adapter = createSessionStateAdapter(store);
+
+    await expect(adapter.write({
+      issueId,
+      companyId,
+      nextState: makeSession({ companyId: otherCompanyId, issueId }),
+      actorAgentId: randomUUID(),
+    })).rejects.toMatchObject({ status: 422 });
   });
 
   it("fails closed when the existing session document is malformed", async () => {
