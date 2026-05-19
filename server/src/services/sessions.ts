@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lte, sql } from "drizzle-orm";
 import type {
   CarSessionTriggerEvaluationRequest,
   CarSessionTriggerSpec,
@@ -19,7 +19,18 @@ import {
   paperclipSessionDocumentSchema,
   paperclipSessionTransitionReceiptDocumentSchema,
 } from "@paperclipai/shared";
-import { agents, heartbeatRuns, issues, routines } from "@paperclipai/db";
+import {
+  activityLog,
+  agents,
+  heartbeatRuns,
+  issueComments,
+  issueDocuments,
+  issues,
+  routines,
+  standupParticipants,
+  standupPolicies,
+  standupSessions,
+} from "@paperclipai/db";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { documentService } from "./documents.js";
 import type { Db } from "@paperclipai/db";
@@ -425,6 +436,30 @@ type SessionIssueRow = {
   title: string;
 };
 
+type CarSessionTriggerCandidate = ReturnType<typeof evaluateCarSessionAdHocTrigger> & {
+  source: string;
+  sourceId: string;
+  evidence: Record<string, unknown>;
+  action: "open_session" | "route_task" | "no_op";
+};
+
+type CarSessionTriggerDetectionInput = {
+  companyId: string;
+  policyKey: string;
+  now?: Date;
+  staleAfterMinutes?: number;
+  openSessionCount?: number;
+  openTaskCount?: number;
+  sessionCap?: number;
+  taskCap?: number;
+};
+
+type CarSessionTriggerDetectionResult = {
+  detectorsRun: Array<CarSessionTriggerSpec["triggerClass"]>;
+  sourceCounts: Record<string, number>;
+  candidates: CarSessionTriggerCandidate[];
+};
+
 const SESSION_TERMINAL_STATES = new Set<PaperclipSessionState>(["completed", "cancelled", "rollback_disabled"]);
 
 const CAR_SESSION_TRIGGER_FRAMEWORK: CarSessionTriggerSpec[] = [
@@ -735,6 +770,63 @@ export function listCarSessionAdHocTriggerFramework() {
   return [...CAR_SESSION_TRIGGER_FRAMEWORK];
 }
 
+function carTriggerSpec(triggerClass: CarSessionTriggerSpec["triggerClass"]) {
+  const spec = CAR_SESSION_TRIGGER_FRAMEWORK.find((candidate) => candidate.triggerClass === triggerClass);
+  if (!spec) throw unprocessable("Unknown CAR session trigger class");
+  return spec;
+}
+
+function numericSignal(value: unknown, fallback = 1) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+const ACTIVE_SESSION_STATES: readonly PaperclipSessionState[] = [
+  "draft",
+  "open",
+  "waiting_response",
+  "reviewing",
+  "accepted",
+  "rejected",
+  "redirected",
+  "blocked",
+];
+
+function isActiveSessionState(state: PaperclipSessionState) {
+  return ACTIVE_SESSION_STATES.includes(state);
+}
+
+function buildTriggerCandidate(input: {
+  triggerClass: CarSessionTriggerSpec["triggerClass"];
+  sourceId: string;
+  severityScore: number;
+  dedupeKey: string;
+  evidence: Record<string, unknown>;
+  openSessionCount?: number;
+  openTaskCount?: number;
+  sessionCap?: number;
+  taskCap?: number;
+  action?: CarSessionTriggerCandidate["action"];
+}) {
+  const spec = carTriggerSpec(input.triggerClass);
+  const evaluated = evaluateCarSessionAdHocTrigger({
+    triggerClass: input.triggerClass,
+    severityInputs: { ...input.evidence, severityScore: input.severityScore },
+    dedupeKey: input.dedupeKey,
+    openSessionCount: input.openSessionCount ?? 0,
+    openTaskCount: input.openTaskCount ?? 0,
+    sessionCap: input.sessionCap ?? 3,
+    taskCap: input.taskCap ?? 12,
+  });
+  return {
+    ...evaluated,
+    source: spec.source,
+    sourceId: input.sourceId,
+    evidence: input.evidence,
+    action: input.action ?? (evaluated.noOpReason ? "no_op" : "open_session"),
+  };
+}
+
 export function sessionService(db: Db) {
   const documents = documentService(db);
   const adapter = createSessionStateAdapter(documents);
@@ -768,6 +860,57 @@ export function sessionService(db: Db) {
     if (agent.status === "pending_approval" || agent.status === "terminated") {
       throw conflict("Participant agent cannot receive session obligations");
     }
+  }
+
+  async function readSessionDocumentsForPolicy(companyId: string, policyKey: string) {
+    const rows = await db
+      .select({
+        issueId: issueDocuments.issueId,
+        updatedAt: issueDocuments.updatedAt,
+      })
+      .from(issueDocuments)
+      .where(and(
+        eq(issueDocuments.companyId, companyId),
+        eq(issueDocuments.key, PAPERCLIP_SESSION_DOCUMENT_KEY),
+      ))
+      .orderBy(desc(issueDocuments.updatedAt))
+      .limit(100);
+
+    const states: Array<{ issueId: string; updatedAt: Date; state: PaperclipSessionDocument }> = [];
+    for (const row of rows) {
+      try {
+        const trusted = await adapter.read(row.issueId);
+        if (trusted?.state.policyKey === policyKey && trusted.state.companyId === companyId) {
+          states.push({ issueId: row.issueId, updatedAt: row.updatedAt, state: trusted.state });
+        }
+      } catch {
+        // The session state gate owns parse/provenance failures. Detection only uses trusted session documents.
+      }
+    }
+    return states;
+  }
+
+  async function countOpenSessionIssues(companyId: string, policyKey: string) {
+    const rows = await readSessionDocumentsForPolicy(companyId, policyKey);
+    return rows.filter((row) => isActiveSessionState(row.state.state)).length;
+  }
+
+  async function activeLinkedSessionRoutineExists(input: {
+    companyId: string;
+    policyKey: string;
+    sessionType: PaperclipSessionDocument["sessionType"];
+  }) {
+    const active = await db
+      .select({ id: routines.id })
+      .from(routines)
+      .where(and(
+        eq(routines.companyId, input.companyId),
+        eq(routines.status, "active"),
+        sql`${routines.linkedSessionPolicy}->>'policyKey' = ${input.policyKey}`,
+        sql`${routines.linkedSessionPolicy}->>'sessionType' = ${input.sessionType}`,
+      ))
+      .limit(1);
+    return active.length > 0;
   }
 
   async function ensureParticipantObligations(
@@ -931,6 +1074,55 @@ export function sessionService(db: Db) {
     return { write: written, ...(await inspect({ issueId: input.issueId })) };
   }
 
+  function assertRouteFindingAllowed(
+    state: PaperclipSessionDocument,
+    input: PaperclipSessionTaskRouteRequest,
+    assigneeAgentId: string | null,
+  ) {
+    const targetParticipant = state.participants.find((participant) => participant.role === input.targetRole);
+    if (!targetParticipant) {
+      throw forbidden("Task route targetRole must match a session participant role");
+    }
+    if (input.intendedOwnerRole !== input.targetRole) {
+      throw forbidden("Task route intendedOwnerRole must match the target participant role");
+    }
+    if (input.assigneeAgentId && targetParticipant.agentId && input.assigneeAgentId !== targetParticipant.agentId) {
+      throw forbidden("Task route assignee must match the target participant agent");
+    }
+    if (input.assigneeAgentId && !targetParticipant.agentId) {
+      throw forbidden("Task route cannot assign outside a target participant");
+    }
+    if (assigneeAgentId && targetParticipant.agentId && assigneeAgentId !== targetParticipant.agentId) {
+      throw forbidden("Task route resolved assignee must match the target participant agent");
+    }
+
+    const materialEodFinding = state.eodFindings.find(
+      (finding) =>
+        finding.findingId === input.sourceFindingId &&
+        finding.ownerRole === input.targetRole &&
+        ["task", "ad_hoc_meeting", "system_change"].includes(finding.disposition),
+    );
+    if (materialEodFinding) return;
+
+    const reviewFinding = state.reviews.find(
+      (review) =>
+        review.domain === input.sourceFindingId &&
+        review.downstreamOwnerRole === input.targetRole &&
+        ["accepted", "rejected", "redirected"].includes(review.disposition ?? ""),
+    );
+    if (reviewFinding) return;
+
+    const healthFinding = state.health.find(
+      (observation) =>
+        observation.observationId === input.sourceFindingId &&
+        observation.ownerRole === input.targetRole &&
+        observation.status !== "healthy",
+    );
+    if (healthFinding) return;
+
+    throw forbidden("Task route sourceFindingId must reference a material session finding for the target role");
+  }
+
   async function validateServiceRunAuthority(input: {
     serviceRunId: string | null | undefined;
     companyId: string;
@@ -965,6 +1157,12 @@ export function sessionService(db: Db) {
     if (snapshot.revokedAt || snapshot.routerRevoked === true || snapshot.routerKillSwitch === true) {
       return { ok: false, reason: "service_run_router_revoked" };
     }
+    const policyActive = await activeLinkedSessionRoutineExists({
+      companyId: input.companyId,
+      policyKey: input.policyKey,
+      sessionType: input.sessionType as PaperclipSessionDocument["sessionType"],
+    });
+    if (!policyActive) return { ok: false, reason: "service_run_policy_disabled" };
     return { ok: true };
   }
 
@@ -995,6 +1193,9 @@ export function sessionService(db: Db) {
 
   async function routeTask(input: PaperclipSessionTaskRouteRequest) {
     assertTaskRouteBoundary(input);
+    if (input.serviceRunId && input.actor.runId !== input.serviceRunId) {
+      throw forbidden("Session task route actor run must match serviceRunId");
+    }
     const trusted = await adapter.read(input.issueId);
     if (!trusted) throw notFound("Session not found");
     if (trusted.document.latestRevisionId !== input.expectedRevisionId) {
@@ -1013,6 +1214,7 @@ export function sessionService(db: Db) {
       authorityPath = assigneeAgentId ? "multi_actor_fallback" : "failed_router";
       if (!assigneeAgentId) blockedReason = "target_role_has_no_participant_agent";
     }
+    assertRouteFindingAllowed(trusted.state, input, assigneeAgentId);
 
     if (input.serviceRunId) {
       const authority = await validateServiceRunAuthority({
@@ -1161,18 +1363,313 @@ export function sessionService(db: Db) {
         sql`${routines.linkedSessionPolicy}->>'sessionType' = ${input.sessionType}`,
       ))
       .returning({ id: routines.id, title: routines.title });
+    const revokedAt = nowIso();
+    const revokedRuns = await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || jsonb_build_object(
+          'routerRevoked', true,
+          'routerKillSwitch', true,
+          'revokedAt', ${revokedAt}::text,
+          'revokedByPolicyKey', ${input.policyKey}::text,
+          'revokedSessionType', ${input.sessionType}::text
+        )`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'policyKey' = ${input.policyKey}`,
+        sql`(
+          ${heartbeatRuns.contextSnapshot}->>'sessionType' = ${input.sessionType}
+          or exists (
+            select 1
+            from jsonb_array_elements_text(coalesce(${heartbeatRuns.contextSnapshot}->'allowedSessionTypes', '[]'::jsonb)) as allowed(session_type)
+            where allowed.session_type = ${input.sessionType}::text
+          )
+        )`,
+      ))
+      .returning({ id: heartbeatRuns.id });
     return {
       companyId: input.companyId,
       policyKey: input.policyKey,
       sessionType: input.sessionType,
       triggerClass: input.triggerClass,
       disabledRoutineIds: disabled.map((row) => row.id),
+      revokedServiceRunIds: revokedRuns.map((row) => row.id),
       preservedHistory: true,
       futureTriggersDisabled: true,
       expectedNoNewSessionProof: input.expectedNoNewSessionProof,
       auditId: randomUUID(),
       actor: input.actor,
     };
+  }
+
+  async function detectAdHocTriggers(input: CarSessionTriggerDetectionInput): Promise<CarSessionTriggerDetectionResult> {
+    const now = input.now ?? new Date();
+    const staleCutoff = new Date(now.getTime() - (input.staleAfterMinutes ?? 60) * 60 * 1000);
+    const detectorsRun = CAR_SESSION_TRIGGER_FRAMEWORK.map((entry) => entry.triggerClass);
+    const sourceCounts = Object.fromEntries(detectorsRun.map((triggerClass) => [triggerClass, 0])) as Record<string, number>;
+    const candidates: CarSessionTriggerCandidate[] = [];
+    const openSessionCount = input.openSessionCount ?? await countOpenSessionIssues(input.companyId, input.policyKey);
+    const openTaskCount = input.openTaskCount ?? await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.originKind, "session_task_route"),
+        inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+      ))
+      .then((rows) => rows.length);
+
+    const pushCandidate = (candidate: Omit<Parameters<typeof buildTriggerCandidate>[0], "openSessionCount" | "openTaskCount" | "sessionCap" | "taskCap">) => {
+      candidates.push(buildTriggerCandidate({
+        ...candidate,
+        openSessionCount,
+        openTaskCount,
+        sessionCap: input.sessionCap,
+        taskCap: input.taskCap,
+      }));
+    };
+
+    const missedStandups = await db
+      .select({
+        participantId: standupParticipants.id,
+        sessionId: standupParticipants.sessionId,
+        agentId: standupParticipants.agentId,
+        roleKey: standupParticipants.roleKey,
+        responseDueAt: standupParticipants.responseDueAt,
+        localDate: standupSessions.localDate,
+        standupPolicyKey: standupPolicies.policyKey,
+      })
+      .from(standupParticipants)
+      .innerJoin(standupSessions, eq(standupParticipants.sessionId, standupSessions.id))
+      .innerJoin(standupPolicies, eq(standupSessions.policyId, standupPolicies.id))
+      .where(and(
+        eq(standupParticipants.companyId, input.companyId),
+        inArray(standupParticipants.responseStatus, ["pending", "missing", "rejected"]),
+        lte(standupParticipants.responseDueAt, now),
+      ))
+      .limit(25);
+    sourceCounts.standup_nonresponse = missedStandups.length;
+    for (const row of missedStandups) {
+      pushCandidate({
+        triggerClass: "standup_nonresponse",
+        sourceId: row.participantId,
+        severityScore: row.responseDueAt <= staleCutoff ? 3 : 2,
+        dedupeKey: `${row.standupPolicyKey}:${row.localDate}:${row.agentId}`,
+        evidence: {
+          participantId: row.participantId,
+          sessionId: row.sessionId,
+          roleKey: row.roleKey,
+          responseDueAt: row.responseDueAt.toISOString(),
+        },
+      });
+    }
+
+    const directiveComments = await db
+      .select({
+        id: issueComments.id,
+        issueId: issueComments.issueId,
+        body: issueComments.body,
+        createdAt: issueComments.createdAt,
+      })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, input.companyId),
+        sql`${issueComments.body} ILIKE ${"%directive%"}`,
+      ))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(100);
+    const directiveCounts = new Map<string, typeof directiveComments>();
+    for (const row of directiveComments) {
+      directiveCounts.set(row.issueId, [...(directiveCounts.get(row.issueId) ?? []), row]);
+    }
+    for (const [issueId, rows] of directiveCounts) {
+      if (rows.length < 2) continue;
+      sourceCounts.repeated_unanswered_directive += rows.length;
+      pushCandidate({
+        triggerClass: "repeated_unanswered_directive",
+        sourceId: issueId,
+        severityScore: rows.length >= 3 ? 3 : 2,
+        dedupeKey: `directive:${issueId}`,
+        evidence: { issueId, repeatCount: rows.length, latestCommentId: rows[0]?.id },
+      });
+    }
+
+    const stalePaperIssues = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, input.companyId),
+        inArray(issues.status, ["todo", "in_progress", "blocked"]),
+        lte(issues.updatedAt, staleCutoff),
+        sql`${issues.originKind} not in ('session_task_route', 'session_participant_obligation')`,
+      ))
+      .limit(25);
+    sourceCounts.full_paper_work_halt = stalePaperIssues.length;
+    if (stalePaperIssues.length > 0) {
+      pushCandidate({
+        triggerClass: "full_paper_work_halt",
+        sourceId: stalePaperIssues[0]!.id,
+        severityScore: stalePaperIssues.some((issue) => issue.status === "blocked") ? 3 : 2,
+        dedupeKey: `paper-halt:${input.companyId}:${staleCutoff.toISOString().slice(0, 13)}`,
+        evidence: {
+          staleIssueCount: stalePaperIssues.length,
+          sampleIssueIds: stalePaperIssues.slice(0, 5).map((issue) => issue.identifier ?? issue.id),
+        },
+      });
+    }
+
+    const generatorRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        updatedAt: heartbeatRuns.updatedAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'generatorState', ${heartbeatRuns.contextSnapshot}->>'state') in ('idle', 'incident', 'nonproductive', 'error')`,
+      ))
+      .orderBy(desc(heartbeatRuns.updatedAt))
+      .limit(10);
+    sourceCounts.generator_nonproductive_state = generatorRuns.length;
+    for (const row of generatorRuns) {
+      const snapshot = asRecord(row.contextSnapshot);
+      const generatorState = String(snapshot.generatorState ?? snapshot.state ?? row.status);
+      pushCandidate({
+        triggerClass: "generator_nonproductive_state",
+        sourceId: row.id,
+        severityScore: generatorState === "incident" || generatorState === "error" ? 3 : 2,
+        dedupeKey: `generator:${snapshot.runtimeLane ?? "default"}:${generatorState}`,
+        evidence: { runId: row.id, generatorState, updatedAt: row.updatedAt.toISOString() },
+      });
+    }
+
+    const sessionRows = await readSessionDocumentsForPolicy(input.companyId, input.policyKey);
+    for (const row of sessionRows) {
+      const state = row.state;
+      if (state.sessionType === "review" && isActiveSessionState(state.state)) {
+        const review = state.reviews[0];
+        const missingChallenge = !review?.challenge && review?.disposition !== "not_applicable";
+        const missingDispositionOwner =
+          review?.disposition &&
+          ["accepted", "rejected", "redirected"].includes(review.disposition) &&
+          !review.downstreamOwnerRole;
+        if (missingChallenge || missingDispositionOwner || state.state === "reviewing") {
+          sourceCounts.failed_or_stalled_review += 1;
+          pushCandidate({
+            triggerClass: "failed_or_stalled_review",
+            sourceId: row.issueId,
+            severityScore: missingDispositionOwner ? 3 : 2,
+            dedupeKey: `review:${row.issueId}:${review?.domain ?? "unqualified"}`,
+            evidence: { issueId: row.issueId, missingChallenge, missingDispositionOwner, state: state.state },
+          });
+        }
+      }
+
+      for (const finding of state.eodFindings) {
+        if (!["task", "ad_hoc_meeting", "system_change"].includes(finding.disposition)) continue;
+        if (!finding.ownerRole) continue;
+        sourceCounts.eod_material_finding += 1;
+        pushCandidate({
+          triggerClass: "eod_material_finding",
+          sourceId: finding.findingId,
+          severityScore: finding.disposition === "system_change" ? 3 : 2,
+          dedupeKey: `eod:${finding.findingId}:${finding.ownerRole}`,
+          evidence: {
+            issueId: row.issueId,
+            findingId: finding.findingId,
+            disposition: finding.disposition,
+            ownerRole: finding.ownerRole,
+          },
+          action: finding.disposition === "task" ? "route_task" : "open_session",
+        });
+      }
+
+      for (const route of state.taskRoutes) {
+        if (route.authorityPath !== "failed_router" && !route.blockedReason) continue;
+        sourceCounts.permission_or_task_router_blocker += 1;
+        pushCandidate({
+          triggerClass: "permission_or_task_router_blocker",
+          sourceId: route.routeId,
+          severityScore: route.routerRevoked ? 3 : 2,
+          dedupeKey: `router:${route.policyKey}:${route.targetRole}:${route.blockedReason ?? route.authorityPath}`,
+          evidence: {
+            issueId: row.issueId,
+            routeId: route.routeId,
+            authorityPath: route.authorityPath,
+            blockedReason: route.blockedReason,
+            targetRole: route.targetRole,
+          },
+          action: "route_task",
+        });
+      }
+    }
+
+    const runtimeEvents = await db
+      .select({
+        id: activityLog.id,
+        action: activityLog.action,
+        entityId: activityLog.entityId,
+        details: activityLog.details,
+        createdAt: activityLog.createdAt,
+      })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        sql`(${activityLog.action} ILIKE ${"%runtime%"} OR ${activityLog.action} ILIKE ${"%health%"} OR ${activityLog.action} ILIKE ${"%error%"})`,
+      ))
+      .orderBy(desc(activityLog.createdAt))
+      .limit(25);
+    for (const event of runtimeEvents) {
+      const details = asRecord(event.details);
+      const status = String(details.status ?? "");
+      const severityScore = numericSignal(details.severityScore ?? details.error_count, event.action.includes("error") ? 3 : 1);
+      if (!["blocked", "degraded", "failed"].includes(status) && severityScore <= 1) continue;
+      sourceCounts.runtime_risk += 1;
+      pushCandidate({
+        triggerClass: "runtime_risk",
+        sourceId: event.id,
+        severityScore,
+        dedupeKey: `runtime:${details.runtime_surface ?? event.entityId}:${details.failure_signature ?? event.action}`,
+        evidence: { action: event.action, entityId: event.entityId, status, details },
+      });
+    }
+
+    const superPassEvents = await db
+      .select({
+        id: activityLog.id,
+        entityId: activityLog.entityId,
+        details: activityLog.details,
+        createdAt: activityLog.createdAt,
+      })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        sql`(${activityLog.action} ILIKE ${"%super%pass%"} OR ${activityLog.details}->>'eventType' = 'super_pass')`,
+      ))
+      .orderBy(desc(activityLog.createdAt))
+      .limit(25);
+    sourceCounts.material_super_pass_event = superPassEvents.length;
+    for (const event of superPassEvents) {
+      const details = asRecord(event.details);
+      pushCandidate({
+        triggerClass: "material_super_pass_event",
+        sourceId: event.id,
+        severityScore: numericSignal(details.score ?? details.severityScore, 3),
+        dedupeKey: `super-pass:${details.strategy_id ?? details.strategyId ?? event.entityId}:${details.eventType ?? "event"}`,
+        evidence: { entityId: event.entityId, details, createdAt: event.createdAt.toISOString() },
+      });
+    }
+
+    return { detectorsRun, sourceCounts, candidates };
   }
 
   return {
@@ -1184,6 +1681,7 @@ export function sessionService(db: Db) {
     rollbackDisable,
     validateServiceRunAuthority,
     evaluateAdHocTrigger: evaluateCarSessionAdHocTrigger,
+    detectAdHocTriggers,
     listAdHocTriggerFramework: listCarSessionAdHocTriggerFramework,
   };
 }
