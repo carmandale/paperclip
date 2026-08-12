@@ -8509,6 +8509,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 { agentId: agent.id, runId: run.id },
               );
               logger.info({ issueId, agentId: agent.id, runId: run.id }, "quota-exhaustion: blocked issue and posted comment");
+              const resetStr = adapterResult.retryNotBefore
+                ? ` Quota resets ${adapterResult.retryNotBefore}.`
+                : "";
+              const telegramText = `⚠️ Claude weekly quota exhausted — ${issueId} blocked.${resetStr} Retries resume when limits reset.`;
+              await execFile(
+                "openclaw",
+                ["message", "send", "--chat-id", "-5223924024", "--text", telegramText],
+                { timeout: 10_000 },
+              ).catch((alertErr) => {
+                logger.warn({ alertErr, issueId, agentId: agent.id }, "quota-exhaustion: telegram alert failed");
+              });
             } catch (err) {
               logger.warn({ err, issueId, agentId: agent.id }, "quota-exhaustion: failed to block issue");
             }
