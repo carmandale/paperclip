@@ -8486,6 +8486,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ).catch((err) => {
           logger.warn({ err, agentId: agent.id, companyId: agent.companyId }, "standup-fallback: check failed");
         });
+        // Block the execution issue and post a comment so it does not become a zombie.
+        // Usage-limit exits happen before the agent posts any comment or updates status,
+        // so the harness must handle this. The issue stays blocked until the quota resets
+        // and the scheduled transient retry fires; at that point the harness auto-checks it
+        // out from "blocked" (see checkout allowed-statuses list) and the agent runs normally.
+        if (issueId) {
+          (async () => {
+            try {
+              const currentIssue = await db
+                .select({ status: issues.status })
+                .from(issues)
+                .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId)))
+                .then((rows) => rows[0] ?? null);
+              if (!currentIssue || currentIssue.status === "done" || currentIssue.status === "cancelled") return;
+              if (currentIssue.status !== "blocked") {
+                await issuesSvc.update(issueId, { status: "blocked" });
+              }
+              await issuesSvc.addComment(
+                issueId,
+                "Run exited due to Claude usage limit — retries will resume when limits reset.",
+                { agentId: agent.id, runId: run.id },
+              );
+              logger.info({ issueId, agentId: agent.id, runId: run.id }, "quota-exhaustion: blocked issue and posted comment");
+            } catch (err) {
+              logger.warn({ err, issueId, agentId: agent.id }, "quota-exhaustion: failed to block issue");
+            }
+          })();
+        }
       }
       if (agent.adapterType === "claude_local") {
         const claudeAdapter = getServerAdapter("claude_local");
