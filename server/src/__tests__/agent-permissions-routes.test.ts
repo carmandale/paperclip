@@ -81,6 +81,11 @@ const mockIssueApprovalService = vi.hoisted(() => ({
 
 const mockIssueService = vi.hoisted(() => ({
   list: vi.fn(),
+  listDependencyReadiness: vi.fn(),
+}));
+
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  listActiveForIssues: vi.fn(),
 }));
 
 const mockSecretService = vi.hoisted(() => ({
@@ -159,6 +164,10 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
   }));
 
+  vi.doMock("../services/issue-recovery-actions.js", () => ({
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
+  }));
+
   vi.doMock("../services/secrets.js", () => ({
     secretService: () => mockSecretService,
   }));
@@ -194,6 +203,7 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     ISSUE_LIST_DEFAULT_LIMIT: 500,
     issueApprovalService: () => mockIssueApprovalService,
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
@@ -1436,6 +1446,67 @@ describe.sequential("agent permission routes", () => {
       touchedByUserId: "board-user",
       inboxArchivedByUserId: "board-user",
       status: "backlog,todo,in_progress,in_review,blocked,done",
+      limit: 500,
+    });
+  });
+
+  it("keeps assignment fields on the inbox-lite view", async () => {
+    mockIssueService.list.mockResolvedValue([
+      {
+        id: "issue-2",
+        identifier: "PAP-911",
+        title: "Blocked follow-up",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+        projectId: "project-1",
+        goalId: "goal-1",
+        parentId: null,
+        updatedAt: "2026-09-01T11:55:00.000Z",
+        activeRun: null,
+      },
+    ]);
+    mockIssueService.listDependencyReadiness.mockResolvedValue(new Map([
+      ["issue-2", { isDependencyReady: false, unresolvedBlockerCount: 2, unresolvedBlockerIssueIds: ["issue-7", "issue-8"] }],
+    ]));
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/agents/me/inbox-lite"));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      {
+        id: "issue-2",
+        identifier: "PAP-911",
+        title: "Blocked follow-up",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+        projectId: "project-1",
+        goalId: "goal-1",
+        parentId: null,
+        updatedAt: "2026-09-01T11:55:00.000Z",
+        activeRun: null,
+        activeRecoveryAction: null,
+        dependencyReady: false,
+        unresolvedBlockerCount: 2,
+        unresolvedBlockerIssueIds: ["issue-7", "issue-8"],
+      },
+    ]);
+    expect(mockIssueService.list).toHaveBeenCalledWith(companyId, {
+      assigneeAgentId: agentId,
+      status: "todo,in_progress,blocked",
+      includeRoutineExecutions: true,
       limit: 500,
     });
   });
