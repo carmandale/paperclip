@@ -1051,6 +1051,33 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  async function findBlockedExecutionIssue(
+    routine: typeof routines.$inferSelect,
+    executor: Db = db,
+    dispatchFingerprint?: string | null,
+    origin?: { kind: string; id: string | null },
+  ) {
+    const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+    const originKind = origin?.kind ?? "routine_execution";
+    const originId = origin?.id ?? routine.id;
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          eq(issues.status, "blocked"),
+          isNull(issues.hiddenAt),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1868,6 +1895,37 @@ export function routineService(
             triggeredAt,
             status,
             issueId: activeIssue.id,
+            nextRunAt,
+          }, txDb);
+          return updated ?? createdRun;
+        }
+
+        const blockedIssue = await findBlockedExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+          kind: issueOriginKind,
+          id: issueOriginId,
+        });
+        if (blockedIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          if (manualRunnerUserId) {
+            await touchIssueForUserInbox(txDb, {
+              companyId: input.routine.companyId,
+              issueId: blockedIssue.id,
+              userId: manualRunnerUserId,
+              touchedAt: triggeredAt,
+            });
+          }
+          const updated = await finalizeRun(createdRun.id, {
+            status,
+            linkedIssueId: blockedIssue.id,
+            coalescedIntoRunId: blockedIssue.originRunId,
+            completedAt: triggeredAt,
+          }, txDb);
+          await updateRoutineTouchedState({
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            triggeredAt,
+            status,
+            issueId: blockedIssue.id,
             nextRunAt,
           }, txDb);
           return updated ?? createdRun;
