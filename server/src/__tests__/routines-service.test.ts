@@ -128,6 +128,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         contextSnapshot?: Record<string, unknown>;
       };
     }> = [];
+    // Recorded, never sent: the default sender execs openclaw, which posts to a real chat.
+    const opsAlerts: string[] = [];
 
     await db.insert(companies).values({
       id: companyId,
@@ -156,6 +158,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
 
     const svc = routineService(db, {
+      opsAlert: async (text) => {
+        opsAlerts.push(text);
+        return true;
+      },
       heartbeat: {
         wakeup: async (wakeupAgentId, wakeupOpts) => {
           wakeups.push({ agentId: wakeupAgentId, opts: wakeupOpts });
@@ -204,7 +210,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       {},
     );
 
-    return { companyId, agentId, issueSvc, projectId, routine, svc, wakeups };
+    return { companyId, agentId, issueSvc, opsAlerts, projectId, routine, svc, wakeups };
   }
 
   async function linkStandupPolicy(fixture: Awaited<ReturnType<typeof seedFixture>>) {
@@ -977,6 +983,74 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         status: "blocked",
       }),
     ]);
+  });
+
+  it("says a fire landed on a blocked issue, and alerts once per blocked issue", async () => {
+    const { companyId, issueSvc, opsAlerts, routine, svc } = await seedFixture();
+    const previousRunId = randomUUID();
+    const blockedIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+    expect(blockedIssue.identifier).toBeTruthy();
+    await db.insert(routineRuns).values([
+      {
+        id: previousRunId,
+        companyId,
+        routineId: routine.id,
+        triggerId: null,
+        source: "manual",
+        status: "failed",
+        failureReason: "Execution issue moved to blocked",
+        triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+        linkedIssueId: blockedIssue.id,
+      },
+      // Swallowed before this change: no reason recorded, so it never announced the block.
+      {
+        companyId,
+        routineId: routine.id,
+        triggerId: null,
+        source: "manual",
+        status: "coalesced",
+        triggeredAt: new Date("2026-03-20T12:30:00.000Z"),
+        linkedIssueId: blockedIssue.id,
+      },
+    ]);
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      { kind: "schedule", label: "Every 30 minutes", cronExpression: "*/30 * * * *", timezone: "America/Chicago" },
+      {},
+    );
+    const expectedReason = `Not run: execution issue ${blockedIssue.identifier} is blocked`;
+
+    await db.update(routineTriggers).set({ nextRunAt: new Date("2026-05-16T13:30:00.000Z") }).where(eq(routineTriggers.id, trigger.id));
+    expect((await svc.tickScheduledTriggers(new Date("2026-05-16T13:30:30.000Z"))).triggered).toBe(1);
+    await db.update(routineTriggers).set({ nextRunAt: new Date("2026-05-16T14:00:00.000Z") }).where(eq(routineTriggers.id, trigger.id));
+    expect((await svc.tickScheduledTriggers(new Date("2026-05-16T14:00:30.000Z"))).triggered).toBe(1);
+
+    const swallowed = (await svc.listRuns(routine.id)).filter((r) => r.source === "schedule");
+    expect(swallowed).toHaveLength(2);
+    for (const run of swallowed) {
+      expect(run.status).toBe("coalesced");
+      expect(run.linkedIssueId).toBe(blockedIssue.id);
+      expect(run.failureReason).toBe(expectedReason);
+    }
+    const [storedTrigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+    expect(storedTrigger?.lastResult).toBe(expectedReason);
+
+    expect(opsAlerts).toHaveLength(1);
+    expect(opsAlerts[0]).toContain(`"${routine.title}" did not run`);
+    expect(opsAlerts[0]).toContain(`blocked execution issue ${blockedIssue.identifier}`);
+
+    const [stillBlocked] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockedIssue.id));
+    expect(stillBlocked?.status).toBe("blocked");
   });
 
   it("touches a coalesced routine issue for the manual runner's inbox", async () => {

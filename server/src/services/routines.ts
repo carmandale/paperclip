@@ -67,6 +67,7 @@ import { logActivity } from "./activity-log.js";
 import { standupService } from "./standups.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { sessionService } from "./sessions.js";
+import { sendOpsTelegramAlert, type OpsAlertFn } from "./ops-telegram.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -577,9 +578,11 @@ export function routineService(
   deps: {
     heartbeat?: IssueAssignmentWakeupDeps;
     pluginWorkerManager?: PluginWorkerManager;
+    opsAlert?: OpsAlertFn;
   } = {},
 ) {
   const issueSvc = issueService(db);
+  const opsAlert = deps.opsAlert ?? sendOpsTelegramAlert;
   const secretsSvc = secretService(db);
   const heartbeat = deps.heartbeat ?? heartbeatService(db, {
     pluginWorkerManager: deps.pluginWorkerManager,
@@ -958,6 +961,7 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
+    resultText?: string;
   }, executor: Db = db) {
     await executor
       .update(routines)
@@ -973,7 +977,7 @@ export function routineService(
         .update(routineTriggers)
         .set({
           lastFiredAt: input.triggeredAt,
-          lastResult: nextResultText(input.status, input.issueId),
+          lastResult: input.resultText ?? nextResultText(input.status, input.issueId),
           nextRunAt: input.nextRunAt === undefined ? undefined : input.nextRunAt,
           updatedAt: new Date(),
         })
@@ -1820,6 +1824,9 @@ export function routineService(
       title,
       description,
     });
+    // Set inside the transaction, sent only after it commits. The cast keeps TypeScript
+    // from narrowing it to null: it cannot see the assignment inside the callback.
+    let swallowedByBlockedIssue = null as string | null;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -1914,10 +1921,29 @@ export function routineService(
               touchedAt: triggeredAt,
             });
           }
+          // Nothing runs while the issue stays blocked, so every later fire lands here too.
+          // Say so on the run and the trigger, and alert once per blocked issue: the
+          // reason on an earlier swallowed run marks that issue as already announced.
+          const blockedIssueLabel = blockedIssue.identifier ?? blockedIssue.id;
+          const swallowedReason = `Not run: execution issue ${blockedIssueLabel} is blocked`;
+          const alreadyAnnounced = await txDb
+            .select({ id: routineRuns.id })
+            .from(routineRuns)
+            .where(
+              and(
+                eq(routineRuns.linkedIssueId, blockedIssue.id),
+                inArray(routineRuns.status, ["coalesced", "skipped"]),
+                isNotNull(routineRuns.failureReason),
+                ne(routineRuns.id, createdRun.id),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows.length > 0);
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: blockedIssue.id,
             coalescedIntoRunId: blockedIssue.originRunId,
+            failureReason: swallowedReason,
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -1927,7 +1953,11 @@ export function routineService(
             status,
             issueId: blockedIssue.id,
             nextRunAt,
+            resultText: swallowedReason,
           }, txDb);
+          if (!alreadyAnnounced) {
+            swallowedByBlockedIssue = blockedIssueLabel;
+          }
           return updated ?? createdRun;
         }
 
@@ -2038,6 +2068,15 @@ export function routineService(
         return failed ?? createdRun;
       }
     });
+
+    if (swallowedByBlockedIssue) {
+      const identifier = swallowedByBlockedIssue;
+      void opsAlert(
+        `⚠️ Paperclip routine "${input.routine.title}" did not run: its fire landed on blocked execution issue ${identifier}. ` +
+          `Every later fire is swallowed the same way until ${identifier} is resolved or cancelled.`,
+        { routineId: input.routine.id, runId: run.id, issue: identifier, alert: "routine-fire-swallowed" },
+      );
+    }
 
     if (input.source === "schedule" || input.source === "webhook") {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
