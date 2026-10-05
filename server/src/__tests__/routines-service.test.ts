@@ -100,6 +100,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
   async function seedFixture(opts?: {
     opsAlertSends?: () => boolean;
+    opsAlertDelayMs?: number;
     wakeup?: (
       agentId: string,
       wakeupOpts: {
@@ -161,6 +162,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const svc = routineService(db, {
       opsAlert: async (text) => {
         opsAlerts.push(text);
+        // A real openclaw send takes seconds; a slow recorder exposes fires racing it.
+        if (opts?.opsAlertDelayMs) await new Promise((resolve) => setTimeout(resolve, opts.opsAlertDelayMs));
         return opts?.opsAlertSends ? opts.opsAlertSends() : true;
       },
       heartbeat: {
@@ -1111,6 +1114,24 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await alertsSettle(fixture, 3, 3);
     expect(opsAlerts[2]).toContain(`blocked execution issue ${olderBlocked.identifier},`);
     expect(opsAlerts[2]).toContain("while it stays blocked.");
+  });
+
+  it("alerts once when two fires land in one tick while the first send is still in flight", async () => {
+    const fixture = await seedFixture({ opsAlertDelayMs: 300 });
+    const { routine, svc } = fixture;
+    await seedBlockedIssue(fixture, "blocked run");
+    const dueAt = new Date("2026-05-16T17:00:00.000Z");
+    for (const label of ["Noon proof", "Noon proof (second trigger)"]) {
+      const { trigger } = await svc.createTrigger(
+        routine.id,
+        { kind: "schedule", label, cronExpression: "0 12 * * *", timezone: "America/Chicago" },
+        {},
+      );
+      await db.update(routineTriggers).set({ nextRunAt: dueAt }).where(eq(routineTriggers.id, trigger.id));
+    }
+
+    expect((await svc.tickScheduledTriggers(new Date(dueAt.getTime() + 30_000))).triggered).toBe(2);
+    await alertsSettle(fixture, 1, 1);
   });
 
   it("retries a swallowed-fire alert that failed to send, under skip_if_active too", async () => {

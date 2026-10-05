@@ -72,6 +72,11 @@ import { sendOpsTelegramAlert, type OpsAlertFn } from "./ops-telegram.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const BLOCKED_FIRE_ALERTED_ACTION = "routine.blocked_fire_alerted";
+// "routineId:issueId" of alerts sent but not yet recorded. The record lands only after the
+// send, outside the routine lock, so a second fire in the same tick (two triggers, or a
+// catch-up) would otherwise alert again. Module-level: several routineService instances
+// dispatch in this one server process.
+const blockedFireAlertsInFlight = new Set<string>();
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
@@ -1839,7 +1844,7 @@ export function routineService(
     });
     // Set inside the transaction, sent only after it commits. The cast keeps TypeScript
     // from narrowing it to null: it cannot see the assignment inside the callback.
-    let swallowedByBlockedIssue = null as string | null;
+    let swallowedByBlockedIssue = null as { label: string; issueId: string } | null;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -1939,15 +1944,11 @@ export function routineService(
           // swallowed fire records a reason on a run linked to its issue, so a spell starts
           // after the newest run here with no reason (a fire that joined the issue while it
           // was live, or one swallowed before this change), and it is announced once an
-          // alert for a fire inside it was really sent. The company/routine filters use the
-          // routine_runs index.
+          // alert for a fire inside it was really sent. An issue unblocked and blocked again
+          // with no fire landing in between stays one spell.
           const blockedIssueLabel = blockedIssue.identifier ?? blockedIssue.id;
           const swallowedReason = `Not run: execution issue ${blockedIssueLabel} is blocked`;
-          const runsOnThisIssue = and(
-            eq(routineRuns.companyId, input.routine.companyId),
-            eq(routineRuns.routineId, input.routine.id),
-            eq(routineRuns.linkedIssueId, blockedIssue.id),
-          );
+          const runsOnThisIssue = eq(routineRuns.linkedIssueId, blockedIssue.id);
           const spellStart = await txDb
             .select({ at: routineRuns.triggeredAt })
             .from(routineRuns)
@@ -1990,8 +1991,8 @@ export function routineService(
             nextRunAt,
             resultText: swallowedReason,
           }, txDb);
-          if (!alreadyAnnounced) {
-            swallowedByBlockedIssue = blockedIssueLabel;
+          if (!alreadyAnnounced && !blockedFireAlertsInFlight.has(`${input.routine.id}:${blockedIssue.id}`)) {
+            swallowedByBlockedIssue = { label: blockedIssueLabel, issueId: blockedIssue.id };
           }
           return updated ?? createdRun;
         }
@@ -2105,15 +2106,17 @@ export function routineService(
     });
 
     if (swallowedByBlockedIssue) {
-      const identifier = swallowedByBlockedIssue;
+      const { label: identifier, issueId } = swallowedByBlockedIssue;
+      const alertKey = `${input.routine.id}:${issueId}`;
+      blockedFireAlertsInFlight.add(alertKey);
       void (async () => {
-        const pile = await listBlockedExecutionIssues(input.routine, db, dispatchFingerprint, {
+        const behind = (await listBlockedExecutionIssues(input.routine, db, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
-        }, 7);
-        const queued = pile.slice(1, 6).map((issue) => issue.identifier ?? issue.id);
+        }, 7)).filter((issue) => issue.id !== issueId);
+        const queued = behind.slice(0, 5).map((issue) => issue.identifier ?? issue.id);
         const queuedText = queued.length > 0
-          ? ` Cancelling it alone moves later fires to the next blocked one: ${queued.join(", ")}${pile.length > 6 ? ", and more" : ""}.`
+          ? ` Cancelling it alone moves later fires to the next blocked one: ${queued.join(", ")}${behind.length > 5 ? ", and more" : ""}.`
           : "";
         const sent = await opsAlert(
           `⚠️ Paperclip routine "${title}" did not run: its fire landed on blocked execution issue ${identifier}, ` +
@@ -2130,9 +2133,11 @@ export function routineService(
           entityId: run.id,
           details: { routineId: input.routine.id, issue: identifier },
         });
-      })().catch((err) => {
-        logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to alert a swallowed routine fire");
-      });
+      })()
+        .catch((err) => {
+          logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to alert a swallowed routine fire");
+        })
+        .finally(() => blockedFireAlertsInFlight.delete(alertKey));
     }
 
     if (input.source === "schedule" || input.source === "webhook") {
