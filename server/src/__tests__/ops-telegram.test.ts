@@ -29,7 +29,7 @@ describe("sendOpsTelegramAlert", () => {
     expect(exec.execFile).toHaveBeenCalledWith(
       "openclaw",
       ["message", "send", "--channel", "telegram", "--target", OPS_TELEGRAM_TARGET, "--message", "hello"],
-      { timeout: 10_000 },
+      { timeout: 30_000 },
       expect.any(Function),
     );
   });

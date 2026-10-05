@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agents,
   companySecretBindings,
   companySecretVersions,
@@ -70,6 +71,7 @@ import { sessionService } from "./sessions.js";
 import { sendOpsTelegramAlert, type OpsAlertFn } from "./ops-telegram.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+const BLOCKED_FIRE_ALERTED_ACTION = "routine.blocked_fire_alerted";
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
@@ -1061,6 +1063,18 @@ export function routineService(
     dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
   ) {
+    const [newest] = await listBlockedExecutionIssues(routine, executor, dispatchFingerprint, origin, 1);
+    return newest ?? null;
+  }
+
+  // Newest first: a fire lands on the first; cancelling it moves later fires to the next.
+  async function listBlockedExecutionIssues(
+    routine: typeof routines.$inferSelect,
+    executor: Db,
+    dispatchFingerprint: string | null | undefined,
+    origin: { kind: string; id: string | null } | undefined,
+    limit: number,
+  ) {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
@@ -1078,8 +1092,7 @@ export function routineService(
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .limit(limit);
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1922,21 +1935,43 @@ export function routineService(
             });
           }
           // Nothing runs while the issue stays blocked, so every later fire lands here too.
-          // Say so on the run and the trigger, and alert once per blocked issue: the
-          // reason on an earlier swallowed run marks that issue as already announced.
+          // Say so on the run and the trigger, and alert once per blocked spell. Only a
+          // swallowed fire records a reason on a run linked to its issue, so a spell starts
+          // after the newest run here with no reason (a fire that joined the issue while it
+          // was live, or one swallowed before this change), and it is announced once an
+          // alert for a fire inside it was really sent. The company/routine filters use the
+          // routine_runs index.
           const blockedIssueLabel = blockedIssue.identifier ?? blockedIssue.id;
           const swallowedReason = `Not run: execution issue ${blockedIssueLabel} is blocked`;
-          const alreadyAnnounced = await txDb
-            .select({ id: routineRuns.id })
+          const runsOnThisIssue = and(
+            eq(routineRuns.companyId, input.routine.companyId),
+            eq(routineRuns.routineId, input.routine.id),
+            eq(routineRuns.linkedIssueId, blockedIssue.id),
+          );
+          const spellStart = await txDb
+            .select({ at: routineRuns.triggeredAt })
             .from(routineRuns)
             .where(
               and(
-                eq(routineRuns.linkedIssueId, blockedIssue.id),
-                inArray(routineRuns.status, ["coalesced", "skipped"]),
-                isNotNull(routineRuns.failureReason),
-                ne(routineRuns.id, createdRun.id),
+                runsOnThisIssue,
+                isNull(routineRuns.failureReason),
               ),
             )
+            .orderBy(desc(routineRuns.triggeredAt))
+            .limit(1)
+            .then((rows) => rows[0]?.at ?? null);
+          const alreadyAnnounced = await txDb
+            .select({ id: routineRuns.id })
+            .from(routineRuns)
+            .innerJoin(
+              activityLog,
+              and(
+                eq(activityLog.entityType, "routine_run"),
+                eq(activityLog.entityId, sql`cast(${routineRuns.id} as text)`),
+                eq(activityLog.action, BLOCKED_FIRE_ALERTED_ACTION),
+              ),
+            )
+            .where(and(runsOnThisIssue, ...(spellStart ? [gt(routineRuns.triggeredAt, spellStart)] : [])))
             .limit(1)
             .then((rows) => rows.length > 0);
           const updated = await finalizeRun(createdRun.id, {
@@ -2071,11 +2106,33 @@ export function routineService(
 
     if (swallowedByBlockedIssue) {
       const identifier = swallowedByBlockedIssue;
-      void opsAlert(
-        `⚠️ Paperclip routine "${input.routine.title}" did not run: its fire landed on blocked execution issue ${identifier}. ` +
-          `Every later fire is swallowed the same way until ${identifier} is resolved or cancelled.`,
-        { routineId: input.routine.id, runId: run.id, issue: identifier, alert: "routine-fire-swallowed" },
-      );
+      void (async () => {
+        const pile = await listBlockedExecutionIssues(input.routine, db, dispatchFingerprint, {
+          kind: issueOriginKind,
+          id: issueOriginId,
+        }, 7);
+        const queued = pile.slice(1, 6).map((issue) => issue.identifier ?? issue.id);
+        const queuedText = queued.length > 0
+          ? ` Cancelling it alone moves later fires to the next blocked one: ${queued.join(", ")}${pile.length > 6 ? ", and more" : ""}.`
+          : "";
+        const sent = await opsAlert(
+          `⚠️ Paperclip routine "${title}" did not run: its fire landed on blocked execution issue ${identifier}, ` +
+            `and every later fire is swallowed the same way while it stays blocked.${queuedText}`,
+          { routineId: input.routine.id, runId: run.id, issue: identifier, alert: "routine-fire-swallowed" },
+        );
+        if (!sent) return;
+        await logActivity(db, {
+          companyId: input.routine.companyId,
+          actorType: "system",
+          actorId: "routine-dispatch",
+          action: BLOCKED_FIRE_ALERTED_ACTION,
+          entityType: "routine_run",
+          entityId: run.id,
+          details: { routineId: input.routine.id, issue: identifier },
+        });
+      })().catch((err) => {
+        logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to alert a swallowed routine fire");
+      });
     }
 
     if (input.source === "schedule" || input.source === "webhook") {

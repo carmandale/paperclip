@@ -99,6 +99,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   });
 
   async function seedFixture(opts?: {
+    opsAlertSends?: () => boolean;
     wakeup?: (
       agentId: string,
       wakeupOpts: {
@@ -160,7 +161,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const svc = routineService(db, {
       opsAlert: async (text) => {
         opsAlerts.push(text);
-        return true;
+        return opts?.opsAlertSends ? opts.opsAlertSends() : true;
       },
       heartbeat: {
         wakeup: async (wakeupAgentId, wakeupOpts) => {
@@ -941,7 +942,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   });
 
   it("reuses a blocked routine issue when the matching execution is no longer live", async () => {
-    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    const fixture = await seedFixture();
+    const { companyId, issueSvc, routine, svc } = fixture;
     const previousRunId = randomUUID();
     const previousIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
@@ -983,74 +985,162 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         status: "blocked",
       }),
     ]);
+    await alertsSettle(fixture, 1, 1);
   });
 
-  it("says a fire landed on a blocked issue, and alerts once per blocked issue", async () => {
-    const { companyId, issueSvc, opsAlerts, routine, svc } = await seedFixture();
-    const previousRunId = randomUUID();
-    const blockedIssue = await issueSvc.create(companyId, {
+  async function seedBlockedIssue(
+    fixture: Awaited<ReturnType<typeof seedFixture>>,
+    title: string,
+  ) {
+    const { companyId, issueSvc, routine } = fixture;
+    const originRunId = randomUUID();
+    const issue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
-      title: routine.title,
+      title,
       description: routine.description,
       status: "blocked",
       priority: routine.priority,
       assigneeAgentId: routine.assigneeAgentId,
       originKind: "routine_execution",
       originId: routine.id,
-      originRunId: previousRunId,
+      originRunId,
     });
-    expect(blockedIssue.identifier).toBeTruthy();
-    await db.insert(routineRuns).values([
-      {
-        id: previousRunId,
-        companyId,
-        routineId: routine.id,
-        triggerId: null,
-        source: "manual",
-        status: "failed",
-        failureReason: "Execution issue moved to blocked",
-        triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
-        linkedIssueId: blockedIssue.id,
-      },
-      // Swallowed before this change: no reason recorded, so it never announced the block.
-      {
-        companyId,
-        routineId: routine.id,
-        triggerId: null,
-        source: "manual",
-        status: "coalesced",
-        triggeredAt: new Date("2026-03-20T12:30:00.000Z"),
-        linkedIssueId: blockedIssue.id,
-      },
-    ]);
+    expect(issue.identifier).toBeTruthy();
+    await db.insert(routineRuns).values({
+      id: originRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "failed",
+      failureReason: "Execution issue moved to blocked",
+      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+      linkedIssueId: issue.id,
+    });
+    return issue;
+  }
+
+  async function fireScheduledTrigger(
+    fixture: Awaited<ReturnType<typeof seedFixture>>,
+    triggerId: string,
+    at: string,
+  ) {
+    await db.update(routineTriggers).set({ nextRunAt: new Date(at) }).where(eq(routineTriggers.id, triggerId));
+    expect((await fixture.svc.tickScheduledTriggers(new Date(new Date(at).getTime() + 30_000))).triggered).toBe(1);
+  }
+
+  async function alertRowsFor(routineId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "routine.blocked_fire_alerted"))
+      .then((rows) => rows.filter((row) => row.details?.routineId === routineId));
+  }
+
+  // The alert is sent after the dispatch returns; wait for it to land before the next fire.
+  async function alertsSettle(fixture: Awaited<ReturnType<typeof seedFixture>>, sends: number, recorded: number) {
+    await vi.waitFor(async () => {
+      expect(fixture.opsAlerts).toHaveLength(sends);
+      expect(await alertRowsFor(fixture.routine.id)).toHaveLength(recorded);
+    });
+    // A fire that must not alert never starts the send; give a wrongly started one time to show.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(fixture.opsAlerts).toHaveLength(sends);
+  }
+
+  it("says a fire landed on a blocked issue, and alerts once per blocked spell", async () => {
+    const fixture = await seedFixture();
+    const { companyId, opsAlerts, routine, svc } = fixture;
+    const olderBlocked = await seedBlockedIssue(fixture, "older blocked run");
+    const blocked = await seedBlockedIssue(fixture, "newest blocked run");
+    // Swallowed before this change: no reason, so it never announced the block.
+    await db.insert(routineRuns).values({
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "coalesced",
+      triggeredAt: new Date("2026-03-20T12:30:00.000Z"),
+      linkedIssueId: blocked.id,
+    });
     const { trigger } = await svc.createTrigger(
       routine.id,
       { kind: "schedule", label: "Every 30 minutes", cronExpression: "*/30 * * * *", timezone: "America/Chicago" },
       {},
     );
-    const expectedReason = `Not run: execution issue ${blockedIssue.identifier} is blocked`;
+    const expectedReason = `Not run: execution issue ${blocked.identifier} is blocked`;
 
-    await db.update(routineTriggers).set({ nextRunAt: new Date("2026-05-16T13:30:00.000Z") }).where(eq(routineTriggers.id, trigger.id));
-    expect((await svc.tickScheduledTriggers(new Date("2026-05-16T13:30:30.000Z"))).triggered).toBe(1);
-    await db.update(routineTriggers).set({ nextRunAt: new Date("2026-05-16T14:00:00.000Z") }).where(eq(routineTriggers.id, trigger.id));
-    expect((await svc.tickScheduledTriggers(new Date("2026-05-16T14:00:30.000Z"))).triggered).toBe(1);
+    await fireScheduledTrigger(fixture, trigger.id, "2026-05-16T13:30:00.000Z");
+    await alertsSettle(fixture, 1, 1);
+    expect(opsAlerts[0]).toContain(`"${routine.title}" did not run`);
+    expect(opsAlerts[0]).toContain(`blocked execution issue ${blocked.identifier},`);
+    expect(opsAlerts[0]).toContain(`the next blocked one: ${olderBlocked.identifier}.`);
+
+    await fireScheduledTrigger(fixture, trigger.id, "2026-05-16T14:00:00.000Z");
+    await alertsSettle(fixture, 1, 1);
 
     const swallowed = (await svc.listRuns(routine.id)).filter((r) => r.source === "schedule");
     expect(swallowed).toHaveLength(2);
     for (const run of swallowed) {
       expect(run.status).toBe("coalesced");
-      expect(run.linkedIssueId).toBe(blockedIssue.id);
+      expect(run.linkedIssueId).toBe(blocked.id);
       expect(run.failureReason).toBe(expectedReason);
     }
     const [storedTrigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
     expect(storedTrigger?.lastResult).toBe(expectedReason);
-
-    expect(opsAlerts).toHaveLength(1);
-    expect(opsAlerts[0]).toContain(`"${routine.title}" did not run`);
-    expect(opsAlerts[0]).toContain(`blocked execution issue ${blockedIssue.identifier}`);
-
-    const [stillBlocked] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockedIssue.id));
+    const [stillBlocked] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, blocked.id));
     expect(stillBlocked?.status).toBe("blocked");
+
+    // The issue was unblocked and a fire joined it while live, then it blocked again: a new spell.
+    await db.insert(routineRuns).values({
+      companyId,
+      routineId: routine.id,
+      triggerId: trigger.id,
+      source: "schedule",
+      status: "coalesced",
+      triggeredAt: new Date("2026-05-16T14:15:00.000Z"),
+      linkedIssueId: blocked.id,
+    });
+    await fireScheduledTrigger(fixture, trigger.id, "2026-05-16T14:30:00.000Z");
+    await alertsSettle(fixture, 2, 2);
+    expect(opsAlerts[1]).toContain(`blocked execution issue ${blocked.identifier},`);
+
+    // Cancelling the newest blocked issue moves the next fire to the one behind it.
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, blocked.id));
+    await fireScheduledTrigger(fixture, trigger.id, "2026-05-16T15:00:00.000Z");
+    await alertsSettle(fixture, 3, 3);
+    expect(opsAlerts[2]).toContain(`blocked execution issue ${olderBlocked.identifier},`);
+    expect(opsAlerts[2]).toContain("while it stays blocked.");
+  });
+
+  it("retries a swallowed-fire alert that failed to send, under skip_if_active too", async () => {
+    let sendSucceeds = false;
+    const fixture = await seedFixture({ opsAlertSends: () => sendSucceeds });
+    const { routine, svc } = fixture;
+    await db.update(routines).set({ concurrencyPolicy: "skip_if_active" }).where(eq(routines.id, routine.id));
+    const blocked = await seedBlockedIssue(fixture, "blocked run");
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      { kind: "schedule", label: "Every 30 minutes", cronExpression: "*/30 * * * *", timezone: "America/Chicago" },
+      {},
+    );
+
+    await fireScheduledTrigger(fixture, trigger.id, "2026-05-16T13:30:00.000Z");
+    await alertsSettle(fixture, 1, 0);
+
+    sendSucceeds = true;
+    await fireScheduledTrigger(fixture, trigger.id, "2026-05-16T14:00:00.000Z");
+    await alertsSettle(fixture, 2, 1);
+
+    await fireScheduledTrigger(fixture, trigger.id, "2026-05-16T14:30:00.000Z");
+    await alertsSettle(fixture, 2, 1);
+
+    const swallowed = (await svc.listRuns(routine.id)).filter((r) => r.source === "schedule");
+    expect(swallowed).toHaveLength(3);
+    for (const run of swallowed) {
+      expect(run.status).toBe("skipped");
+      expect(run.failureReason).toBe(`Not run: execution issue ${blocked.identifier} is blocked`);
+    }
   });
 
   it("touches a coalesced routine issue for the manual runner's inbox", async () => {

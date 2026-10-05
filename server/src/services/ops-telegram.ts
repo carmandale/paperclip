@@ -19,7 +19,7 @@ export const sendOpsTelegramAlert: OpsAlertFn = async (text, context = {}) => {
     await execFile(
       "openclaw",
       ["message", "send", "--channel", "telegram", "--target", OPS_TELEGRAM_TARGET, "--message", text],
-      { timeout: 10_000 },
+      { timeout: 30_000 },
     );
     return true;
   } catch (err) {
