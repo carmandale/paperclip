@@ -1961,6 +1961,9 @@ export function routineService(
             .orderBy(desc(routineRuns.triggeredAt))
             .limit(1)
             .then((rows) => rows[0]?.at ?? null);
+          // Read before the announced check: a key leaves the set only after its alert row
+          // commits (or with no alert sent), so a miss here means the query below sees that row.
+          const alertInFlight = blockedFireAlertsInFlight.has(`${input.routine.id}:${blockedIssue.id}`);
           const alreadyAnnounced = await txDb
             .select({ id: routineRuns.id })
             .from(routineRuns)
@@ -1991,7 +1994,7 @@ export function routineService(
             nextRunAt,
             resultText: swallowedReason,
           }, txDb);
-          if (!alreadyAnnounced && !blockedFireAlertsInFlight.has(`${input.routine.id}:${blockedIssue.id}`)) {
+          if (!alreadyAnnounced && !alertInFlight) {
             swallowedByBlockedIssue = { label: blockedIssueLabel, issueId: blockedIssue.id };
           }
           return updated ?? createdRun;

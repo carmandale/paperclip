@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -101,6 +101,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   async function seedFixture(opts?: {
     opsAlertSends?: () => boolean;
     opsAlertDelayMs?: number;
+    opsAlertWaitFor?: Promise<unknown>;
     wakeup?: (
       agentId: string,
       wakeupOpts: {
@@ -164,6 +165,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         opsAlerts.push(text);
         // A real openclaw send takes seconds; a slow recorder exposes fires racing it.
         if (opts?.opsAlertDelayMs) await new Promise((resolve) => setTimeout(resolve, opts.opsAlertDelayMs));
+        if (opts?.opsAlertWaitFor) await opts.opsAlertWaitFor;
         return opts?.opsAlertSends ? opts.opsAlertSends() : true;
       },
       heartbeat: {
@@ -1131,6 +1133,57 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     }
 
     expect((await svc.tickScheduledTriggers(new Date(dueAt.getTime() + 30_000))).triggered).toBe(2);
+    await alertsSettle(fixture, 1, 1);
+  });
+
+  it("alerts once when the first send finishes while a later fire is between its announced and in-flight checks", async () => {
+    let finishFirstSend!: () => void;
+    const fixture = await seedFixture({
+      opsAlertWaitFor: new Promise<void>((resolve) => {
+        finishFirstSend = resolve;
+      }),
+    });
+    const { routine, svc } = fixture;
+    await seedBlockedIssue(fixture, "blocked run");
+    const schedule = { kind: "schedule", cronExpression: "*/30 * * * *", timezone: "America/Chicago" } as const;
+    const { trigger: first } = await svc.createTrigger(routine.id, { ...schedule, label: "First" }, {});
+    const { trigger: second } = await svc.createTrigger(routine.id, { ...schedule, label: "Second" }, {});
+
+    await fireScheduledTrigger(fixture, first.id, "2026-05-16T13:30:00.000Z");
+    await vi.waitFor(() => expect(fixture.opsAlerts).toHaveLength(1));
+
+    // The second fire updates its trigger row after reading "already announced" and before
+    // checking the in-flight set; holding that row parks it exactly there. "No key" lets its
+    // run insert's foreign-key check on the same row through.
+    let releaseTrigger!: () => void;
+    let triggerLocked!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      triggerLocked = resolve;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select id from ${routineTriggers} where ${routineTriggers.id} = ${second.id} for no key update`,
+      );
+      triggerLocked();
+      await new Promise<void>((resolve) => {
+        releaseTrigger = resolve;
+      });
+    });
+    await locked;
+    const secondFire = svc.runRoutine(routine.id, { source: "manual", triggerId: second.id });
+    await vi.waitFor(async () => {
+      const parked = await db.execute(sql`select query from pg_stat_activity where wait_event_type = 'Lock'`);
+      expect(parked.map((row) => String(row.query))).toEqual([expect.stringMatching(/^update "routine_triggers"/)]);
+    });
+
+    // The first send lands: its alert row commits, then its in-flight key is released.
+    finishFirstSend();
+    await vi.waitFor(async () => expect(await alertRowsFor(routine.id)).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    releaseTrigger();
+    await holder;
+    expect((await secondFire).failureReason).toMatch(/^Not run: execution issue .* is blocked$/);
     await alertsSettle(fixture, 1, 1);
   });
 
