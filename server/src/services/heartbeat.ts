@@ -175,6 +175,7 @@ import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { checkAndFireStandupFallback } from "./standup-fallback.js";
 import { checkAndFireClaudeLocalQuotaAlert } from "./quota-alert.js";
+import { sendOpsTelegramAlert } from "./ops-telegram.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -8513,13 +8514,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ? ` Quota resets ${adapterResult.retryNotBefore}.`
                 : "";
               const telegramText = `⚠️ Claude weekly quota exhausted — ${issueId} blocked.${resetStr} Retries resume when limits reset.`;
-              await execFile(
-                "openclaw",
-                ["message", "send", "--chat-id", "-5223924024", "--text", telegramText],
-                { timeout: 10_000 },
-              ).catch((alertErr) => {
-                logger.warn({ alertErr, issueId, agentId: agent.id }, "quota-exhaustion: telegram alert failed");
-              });
+              await sendOpsTelegramAlert(telegramText, { issueId, agentId: agent.id, alert: "quota-exhaustion" });
             } catch (err) {
               logger.warn({ err, issueId, agentId: agent.id }, "quota-exhaustion: failed to block issue");
             }
